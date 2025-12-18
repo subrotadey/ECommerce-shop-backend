@@ -1,5 +1,4 @@
-// E-commerce Server site - FIXED
-
+// E-commerce Server site
 const express = require("express");
 const cors = require("cors");
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
@@ -19,7 +18,9 @@ const client = new MongoClient(uri, {
     version: ServerApiVersion.v1,
     strict: true,
     deprecationErrors: true,
-  }
+  },
+  serverSelectionTimeoutMS: 10000, // 10 seconds
+  socketTimeoutMS: 45000,
 });
 
 async function run() {
@@ -32,6 +33,7 @@ async function run() {
     // Collections
     const productsCollection = database.collection("products");
     const cartsCollection = database.collection("carts");
+    const wishlistsCollection = database.collection("wishlists")
 
     // ============================================
     // PRODUCTS ROUTES
@@ -91,7 +93,6 @@ async function run() {
 
         res.send({ items: cart?.items || [] });
       } catch (err) {
-        console.error("❌ Cart fetch error:", err);
         res.status(500).send({ error: "Failed to fetch cart" });
       }
     });
@@ -102,15 +103,15 @@ async function run() {
         const userId = req.params.userId;
         const items = req.body.items || [];
 
-        console.log("💾 Saving cart for user:", userId);
-        console.log("Items count:", items.length);
+        // console.log("💾 Saving cart for user:", userId);
+        // console.log("Items count:", items.length );
 
         // Validate items
         const validItems = items.filter(item => 
           item.key && item.productId && item.qty > 0
         );
 
-        console.log("Valid items count:", validItems.length);
+        // console.log("Valid items count:", validItems.length);
 
         const result = await cartsCollection.updateOne(
           { userId },
@@ -343,6 +344,216 @@ async function run() {
         res.status(500).send({ error: "Failed to get cart count" });
       }
     });
+
+
+    // ============================================
+    // 🆕 WISHLIST ROUTES
+    // ============================================
+
+    // GET - Fetch user's wishlist
+    app.get("/api/wishlist/:userId", async (req, res) => {
+      try {
+        const userId = req.params.userId;
+        console.log("📥 GET wishlist for user:", userId);
+
+        // Fetch wishlist with product details using aggregation
+        const wishlistItems = await wishlistsCollection
+          .aggregate([
+            { 
+              $match: { userId: userId } // Using string userId
+            },
+            {
+              $addFields: {
+                productObjectId: { $toObjectId: "$productId" }
+              }
+            },
+            {
+              $lookup: {
+                from: "products",
+                localField: "productObjectId",
+                foreignField: "_id",
+                as: "productDetails"
+              }
+            },
+            {
+              $unwind: {
+                path: "$productDetails",
+                preserveNullAndEmptyArrays: false
+              }
+            },
+            {
+              $sort: { addedAt: -1 }
+            },
+            {
+              $project: {
+                _id: 1,
+                userId: 1,
+                productId: 1,
+                addedAt: 1,
+                product: "$productDetails"
+              }
+            }
+          ])
+          .toArray();
+
+        console.log(`✅ Found ${wishlistItems.length} wishlist items`);
+        res.send(wishlistItems);
+      } catch (err) {
+        console.error("❌ Wishlist fetch error:", err);
+        res.status(500).send({ 
+          error: "Failed to fetch wishlist",
+          message: err.message 
+        });
+      }
+    });
+
+    // POST - Toggle wishlist (add/remove)
+    app.post("/api/wishlist/:userId/toggle", async (req, res) => {
+      try {
+        const userId = req.params.userId;
+        const { productId } = req.body;
+
+        console.log("🔄 Toggle wishlist - User:", userId, "Product:", productId);
+
+        if (!productId) {
+          return res.status(400).json({ 
+            success: false,
+            message: "Product ID is required" 
+          });
+        }
+
+        // Check if product exists
+        const product = await productsCollection.findOne({ 
+          _id: new ObjectId(productId) 
+        });
+
+        if (!product) {
+          return res.status(404).json({ 
+            success: false,
+            message: "Product not found" 
+          });
+        }
+
+        // Check if already in wishlist
+        const existingItem = await wishlistsCollection.findOne({
+          userId: userId,
+          productId: productId
+        });
+
+        if (existingItem) {
+          // Remove from wishlist
+          await wishlistsCollection.deleteOne({
+            userId: userId,
+            productId: productId
+          });
+
+          console.log("➖ Removed from wishlist");
+          return res.status(200).json({ 
+            success: true,
+            message: "Product removed from wishlist",
+            inWishlist: false 
+          });
+        } else {
+          // Add to wishlist
+          const wishlistItem = {
+            userId: userId,
+            productId: productId,
+            addedAt: new Date()
+          };
+
+          await wishlistsCollection.insertOne(wishlistItem);
+
+          console.log("➕ Added to wishlist");
+          return res.status(201).json({ 
+            success: true,
+            message: "Product added to wishlist",
+            inWishlist: true 
+          });
+        }
+      } catch (err) {
+        console.error("❌ Toggle wishlist error:", err);
+        res.status(500).json({ 
+          success: false,
+          message: "Error toggling wishlist",
+          error: err.message 
+        });
+      }
+    });
+
+    // DELETE - Remove from wishlist
+    app.delete("/api/wishlist/:userId/remove/:productId", async (req, res) => {
+      try {
+        const { userId, productId } = req.params;
+
+        console.log("🗑️ Removing from wishlist - User:", userId, "Product:", productId);
+
+        const result = await wishlistsCollection.deleteOne({
+          userId: userId,
+          productId: productId
+        });
+
+        if (result.deletedCount === 0) {
+          return res.status(404).json({ 
+            success: false,
+            message: "Item not found in wishlist" 
+          });
+        }
+
+        console.log("✅ Item removed from wishlist");
+        res.json({ 
+          success: true,
+          message: "Product removed from wishlist" 
+        });
+      } catch (err) {
+        console.error("❌ Remove from wishlist error:", err);
+        res.status(500).json({ 
+          success: false,
+          message: "Error removing from wishlist",
+          error: err.message 
+        });
+      }
+    });
+
+    // GET - Check if product is in wishlist
+    app.get("/api/wishlist/:userId/check/:productId", async (req, res) => {
+      try {
+        const { userId, productId } = req.params;
+
+        const existingItem = await wishlistsCollection.findOne({
+          userId: userId,
+          productId: productId
+        });
+
+        res.json({ inWishlist: !!existingItem });
+      } catch (err) {
+        console.error("❌ Check wishlist error:", err);
+        res.status(500).json({ 
+          error: "Error checking wishlist",
+          message: err.message 
+        });
+      }
+    });
+
+    // GET - Get wishlist count
+    app.get("/api/wishlist/:userId/count", async (req, res) => {
+      try {
+        const userId = req.params.userId;
+
+        const count = await wishlistsCollection.countDocuments({
+          userId: userId
+        });
+
+        res.json({ count });
+      } catch (err) {
+        console.error("❌ Wishlist count error:", err);
+        res.status(500).json({ 
+          error: "Error getting wishlist count",
+          message: err.message 
+        });
+      }
+    });
+
+
 
   } catch (err) {
     console.error("❌ MongoDB connection error:", err);
