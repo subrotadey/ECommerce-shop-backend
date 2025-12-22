@@ -1,15 +1,86 @@
 // E-commerce Server site
 const express = require("express");
 const cors = require("cors");
+const jwt = require("jsonwebtoken");
+const cookieParser = require("cookie-parser");
+const bodyParser = require("body-parser");
+const crypto = require("crypto");
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 require("dotenv").config();
+const cloudinary = require("cloudinary").v2;
 const port = process.env.PORT || 5000;
 
 const app = express();
 
 //middleware
-app.use(cors());
+app.use(cors({
+  origin: ['http://localhost:5173'],
+  credentials: true,
+}));
 app.use(express.json());
+app.use(cookieParser());
+
+
+
+var admin = require("firebase-admin");
+
+var serviceAccount = require("./anis-abaiya-firebase-admin-key.json");
+
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount)
+});
+
+
+
+
+
+const logger = (req, res, next) => {
+  console.log(`${req.method} ${req.url}`);
+  console.log('inside the logger');
+  next();
+};
+
+const verifyToken = (req, res, next) => {
+  const token = req?.cookies?.access_token;
+
+  if (!token) {
+    return res.status(401).json({ 
+      success: false,
+      message: "Unauthorized access, token missing" 
+    });
+  }
+
+  jwt.verify(token, process.env.JWT_ACCESS_SECRET, (err, decoded) => {
+    if (err) {
+      return res.status(403).json({ 
+        success: false,
+        message: "Invalid access token" 
+      });
+    }
+    req.decoded = decoded;
+    // console.log('Decoded JWT:', decoded);
+    next();
+  });
+}
+
+const verifyFirebaseToken = async(req, res, next) => {
+  const authHeader = req?.headers?.authorization;
+  const token = authHeader.split(' ')[1]
+  if(!token){
+    return res.status(401).json({ 
+      success: false,
+      message: "Unauthorized access, token missing" 
+    });
+  }
+  const userInfo = await admin.auth().verifyIdToken(token);
+  req.tokenEmail = userInfo?.email
+  next()
+}
+// app.use(logger);
+// app.use(bodyParser.json());
+// app.use(bodyParser.urlencoded({ extended: true }));
+
+// MongoDB connection
 
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.hs9qs.mongodb.net/?retryWrites=true&w=majority`;
 
@@ -23,6 +94,13 @@ const client = new MongoClient(uri, {
   socketTimeoutMS: 45000,
 });
 
+// Configure Cloudinary (add after MongoDB setup)
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET
+});
+
 async function run() {
   try {
     await client.connect();
@@ -34,6 +112,58 @@ async function run() {
     const productsCollection = database.collection("products");
     const cartsCollection = database.collection("carts");
     const wishlistsCollection = database.collection("wishlists")
+
+    // ============================================
+    // JWT VERIFICATION MIDDLEWARE
+    // ============================================
+    // function verifyJWT(req, res, next) {
+    //   const authHeader = req.headers.authorization;
+    //   if (!authHeader) {
+    //     return res.status(401).send({ error: "Unauthorized access" });
+    //   }
+
+    //   const token = authHeader.split(" ")[1];
+
+    //   jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
+    //     if (err) {
+    //       return res.status(403).send({ error: "Forbidden access" });
+    //     }
+    //     req.decoded = decoded;
+    //     next();
+    //   });
+    // }
+
+    // JWT TOKEN GENERATION ROUTE
+    // app.post("/jwt", (req, res) => {
+    //   const user = req.body;
+    //   const token = jwt.sign(user, process.env.JWT_SECRET, {
+    //     expiresIn: "7d",
+    //   });
+    //   res.send({ token });
+    // });
+
+    app.post("/jwt", (req, res) => {
+      const userData = req.body;
+
+      const token = jwt.sign(
+        {
+          email: userData.email,
+        }, 
+        process.env.JWT_ACCESS_SECRET, 
+        {
+        expiresIn: "7d",
+      });
+
+      // set the token in an HTTP-only cookie
+      res.cookie('access_token', token, {
+        httpOnly: true,
+        secure: process.env.NODE_ENV === 'production', // use secure cookies in production
+        maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+        sameSite: 'Lax',
+      });
+
+      res.send({success: true});
+    });
 
     // ============================================
     // PRODUCTS ROUTES
@@ -56,7 +186,6 @@ async function run() {
         const products = await productsCollection.find(query).toArray();
         res.send(products);
       } catch (err) {
-        console.error("❌ Products fetch error:", err);
         res.status(500).send({ error: "Failed to fetch products" });
       }
     });
@@ -73,10 +202,393 @@ async function run() {
         
         res.send(product);
       } catch (err) {
-        console.error("❌ Product fetch error:", err);
         res.status(500).send({ error: "Failed to fetch product" });
       }
     });
+
+
+
+
+    // ============================================
+// 🆕 NEW ROUTES - ADD THESE BELOW
+// ============================================
+
+    // POST - Create new product (IMPROVED VALIDATION)
+app.post("/api/products", async (req, res) => {
+  try {
+    const productData = req.body;
+
+    // ✅ Validate required fields
+    const requiredFields = ['sku', 'productName', 'newPrice', 'stock'];
+    for (const field of requiredFields) {
+      if (!productData[field]) {
+        return res.status(400).json({ 
+          success: false,
+          message: `Missing required field: ${field}` 
+        });
+      }
+    }
+
+    // ✅ NEW: Validate images array
+    if (!productData.images || !Array.isArray(productData.images) || productData.images.length === 0) {
+      return res.status(400).json({ 
+        success: false,
+        message: "At least one product image is required" 
+      });
+    }
+
+    // ✅ NEW: Validate price values
+    if (productData.newPrice <= 0) {
+      return res.status(400).json({ 
+        success: false,
+        message: "Price must be greater than 0" 
+      });
+    }
+
+    if (productData.oldPrice && productData.oldPrice < productData.newPrice) {
+      return res.status(400).json({ 
+        success: false,
+        message: "Old price must be greater than new price" 
+      });
+    }
+
+    // ✅ NEW: Validate stock
+    if (productData.stock < 0) {
+      return res.status(400).json({ 
+        success: false,
+        message: "Stock cannot be negative" 
+      });
+    }
+
+    // Check if SKU already exists
+    const existingProduct = await productsCollection.findOne({ 
+      sku: productData.sku 
+    });
+    
+    if (existingProduct) {
+      return res.status(400).json({ 
+        success: false,
+        message: "Product with this SKU already exists" 
+      });
+    }
+
+    // Add timestamps
+    productData.createdAt = new Date();
+    productData.updatedAt = new Date();
+    
+    if (!productData.status) {
+      productData.status = 'active';
+    }
+
+    // Insert product
+    const result = await productsCollection.insertOne(productData);
+
+    res.status(201).json({
+      success: true,
+      message: "Product created successfully",
+      product: {
+        _id: result.insertedId,
+        ...productData
+      }
+    });
+
+  } catch (err) {
+    res.status(500).json({ 
+      success: false,
+      message: "Error creating product", 
+      error: err.message 
+    });
+  }
+});
+
+
+    // PUT - Update product
+    app.put("/api/products/:id", async (req, res) => {
+      try {
+        const id = req.params.id;
+        const updateData = req.body;
+
+        delete updateData._id;
+        updateData.updatedAt = new Date();
+
+        const result = await productsCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: updateData }
+        );
+
+        if (result.matchedCount === 0) {
+          return res.status(404).json({ 
+            success: false,
+            message: "Product not found" 
+          });
+        }
+
+        const updatedProduct = await productsCollection.findOne({ 
+          _id: new ObjectId(id) 
+        });
+
+        res.json({
+          success: true,
+          message: "Product updated successfully",
+          product: updatedProduct
+        });
+
+      } catch (err) {
+        res.status(500).json({ 
+          success: false,
+          message: "Error updating product", 
+          error: err.message 
+        });
+      }
+    });
+
+
+    // DELETE - Delete product
+    app.delete("/api/products/:id", async (req, res) => {
+      try {
+        const id = req.params.id;
+
+        const result = await productsCollection.deleteOne({ 
+          _id: new ObjectId(id) 
+        });
+
+        if (result.deletedCount === 0) {
+          return res.status(404).json({ 
+            success: false,
+            message: "Product not found" 
+          });
+        }
+
+        res.json({
+          success: true,
+          message: "Product deleted successfully"
+        });
+
+      } catch (err) {
+        res.status(500).json({ 
+          success: false,
+          message: "Error deleting product", 
+          error: err.message 
+        });
+      }
+    });
+
+
+    // PATCH - Update product status
+    app.patch("/api/products/:id/status", async (req, res) => {
+      try {
+        const id = req.params.id;
+        const { status } = req.body;
+        
+
+        if (!['active', 'draft', 'archived'].includes(status)) {
+          return res.status(400).json({ 
+            success: false,
+            message: "Invalid status value" 
+          });
+        }
+
+        const result = await productsCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { 
+            $set: { 
+              status: status,
+              updatedAt: new Date()
+            } 
+          }
+        );
+
+        if (result.matchedCount === 0) {
+          return res.status(404).json({ 
+            success: false,
+            message: "Product not found" 
+          });
+        }
+
+        const updatedProduct = await productsCollection.findOne({ 
+          _id: new ObjectId(id) 
+        });
+
+        res.json({
+          success: true,
+          message: "Product status updated successfully",
+          product: updatedProduct
+        });
+
+      } catch (err) {
+        res.status(500).json({ 
+          success: false,
+          message: "Error updating product status", 
+          error: err.message 
+        });
+      }
+    });
+
+
+// ============================================
+// CLOUDINARY DELETE ROUTES (ADD THESE)
+// ============================================
+
+    // ============================================
+// CLOUDINARY DELETE ROUTES (FIXED VERSION)
+// ============================================
+
+// DELETE single image from Cloudinary
+app.delete("/api/cloudinary/delete/image", async (req, res) => {
+  try {
+    const { publicId } = req.body;
+
+    if (!publicId) {
+      return res.status(400).json({ 
+        success: false,
+        message: "Public ID is required" 
+      });
+    }
+
+    // Verify Cloudinary config
+    const config = cloudinary.config();
+    console.log("Cloudinary Config Check:", {
+      cloudName: config.cloud_name,
+      apiKey: config.api_key,
+      hasApiSecret: !!config.api_secret,
+      secretLength: config.api_secret?.length
+    });
+
+    if (!config.cloud_name || !config.api_key || !config.api_secret) {
+      return res.status(500).json({
+        success: false,
+        message: "Cloudinary configuration error"
+      });
+    }
+    
+    // Delete from Cloudinary
+    const result = await cloudinary.uploader.destroy(publicId, {
+      invalidate: true,
+      resource_type: 'image'
+    });
+
+
+    // Handle different result statuses
+    if (result.result === 'ok') {
+      return res.json({ 
+        success: true,
+        message: "Image deleted successfully from Cloudinary",
+        result: result
+      });
+    } else if (result.result === 'not found') {
+      return res.json({ 
+        success: true,
+        message: "Image not found (may already be deleted)",
+        result: result
+      });
+    } else {
+      return res.status(500).json({ 
+        success: false,
+        message: "Failed to delete image",
+        result: result
+      });
+    }
+
+  } catch (err) {
+    console.error("Error details:", {
+      message: err.message,
+      name: err.name,
+      code: err.code,
+      http_code: err.http_code
+    });
+    
+    res.status(500).json({ 
+      success: false,
+      message: err.message || "Error deleting image from Cloudinary",
+      error: {
+        message: err.message,
+        name: err.name,
+        http_code: err.http_code
+      }
+    });
+  }
+});
+
+// DELETE single video from Cloudinary
+app.delete("/api/cloudinary/delete/video", async (req, res) => {
+  try {
+    const { publicId } = req.body;
+
+
+    if (!publicId) {
+      return res.status(400).json({ 
+        success: false,
+        message: "Public ID is required" 
+      });
+    }
+
+    const result = await cloudinary.uploader.destroy(publicId, {
+      invalidate: true,
+      resource_type: 'video'
+    });
+
+    if (result.result === 'ok' || result.result === 'not found') {
+      return res.json({ 
+        success: true,
+        message: "Video deleted successfully",
+        result: result
+      });
+    } else {
+      return res.status(500).json({ 
+        success: false,
+        message: "Failed to delete video",
+        result: result
+      });
+    }
+
+  } catch (err) {
+    res.status(500).json({ 
+      success: false,
+      message: "Error deleting video from Cloudinary",
+      error: err.message 
+    });
+  }
+});
+
+// DELETE batch images
+app.post("/api/cloudinary/delete/batch", async (req, res) => {
+  try {
+    const { publicIds } = req.body;
+
+    if (!Array.isArray(publicIds) || publicIds.length === 0) {
+      return res.status(400).json({ 
+        success: false,
+        message: "Public IDs array is required" 
+      });
+    }
+
+    const result = await cloudinary.api.delete_resources(publicIds, {
+      invalidate: true,
+      resource_type: 'image'
+    });
+    
+    const deletedCount = Object.keys(result.deleted).length;
+    
+
+    return res.json({ 
+      success: true,
+      message: `${deletedCount} images deleted successfully`,
+      result: result,
+      deletedCount: deletedCount,
+      totalRequested: publicIds.length
+    });
+
+  } catch (err) {
+    res.status(500).json({ 
+      success: false,
+      message: "Error batch deleting images",
+      error: err.message 
+    });
+  }
+});
+
+
+
 
     // ============================================
     // CART ROUTES - FIXED (using cartsCollection directly)
@@ -86,10 +598,8 @@ async function run() {
     app.get("/api/cart/:userId", async (req, res) => {
       try {
         const userId = req.params.userId;
-        console.log("📥 GET cart for user:", userId);
 
         const cart = await cartsCollection.findOne({ userId });
-        console.log("Cart found:", cart ? "Yes" : "No");
 
         res.send({ items: cart?.items || [] });
       } catch (err) {
@@ -103,15 +613,11 @@ async function run() {
         const userId = req.params.userId;
         const items = req.body.items || [];
 
-        // console.log("💾 Saving cart for user:", userId);
-        // console.log("Items count:", items.length );
-
         // Validate items
         const validItems = items.filter(item => 
           item.key && item.productId && item.qty > 0
         );
 
-        // console.log("Valid items count:", validItems.length);
 
         const result = await cartsCollection.updateOne(
           { userId },
@@ -124,11 +630,8 @@ async function run() {
           { upsert: true }
         );
 
-        console.log("✅ Cart saved. Modified:", result.modifiedCount, "Upserted:", result.upsertedCount);
-
         res.send({ success: true, items: validItems });
       } catch (err) {
-        console.error("❌ Cart save error:", err);
         res.status(500).send({ error: "Failed to save cart" });
       }
     });
@@ -139,7 +642,6 @@ async function run() {
         const { userId } = req.params;
         const item = req.body;
 
-        console.log("➕ Adding item for user:", userId);
 
         if (!item || !item.key || !item.productId || !item.qty) {
           return res.status(400).json({ 
@@ -151,7 +653,6 @@ async function run() {
         const cart = await cartsCollection.findOne({ userId });
 
         if (!cart) {
-          console.log("Creating new cart...");
           await cartsCollection.insertOne({
             userId,
             items: [item],
@@ -184,14 +685,12 @@ async function run() {
           }
         );
 
-        console.log("✅ Item added");
         res.json({ 
           success: true, 
           message: "Item added to cart",
           items: cart.items
         });
       } catch (err) {
-        console.error("❌ Add to cart error:", err);
         res.status(500).json({ 
           success: false,
           message: "Cannot add item to cart" 
@@ -204,8 +703,6 @@ async function run() {
       try {
         const { userId, itemKey } = req.params;
         const { qty } = req.body;
-
-        console.log("🔄 Updating item:", itemKey, "qty:", qty);
 
         if (qty === undefined || qty < 0) {
           return res.status(400).json({ 
@@ -248,14 +745,12 @@ async function run() {
           }
         );
 
-        console.log("✅ Cart updated");
         res.json({ 
           success: true, 
           message: "Cart updated",
           items: cart.items
         });
       } catch (err) {
-        console.error("❌ Update cart error:", err);
         res.status(500).json({ 
           success: false,
           message: "Cannot update cart" 
@@ -267,8 +762,6 @@ async function run() {
     app.delete("/api/cart/:userId/remove/:itemKey", async (req, res) => {
       try {
         const { userId, itemKey } = req.params;
-
-        console.log("🗑️ Removing item:", itemKey);
         
         const result = await cartsCollection.updateOne(
           { userId },
@@ -285,13 +778,11 @@ async function run() {
           });
         }
 
-        console.log("✅ Item removed");
         res.json({ 
           success: true, 
           message: "Item removed from cart" 
         });
       } catch (err) {
-        console.error("❌ Remove error:", err);
         res.status(500).json({ 
           success: false,
           message: "Cannot remove item from cart" 
@@ -303,8 +794,6 @@ async function run() {
     app.delete("/api/cart/:userId/clear", async (req, res) => {
       try {
         const { userId } = req.params;
-
-        console.log("🧹 Clearing cart for:", userId);
         
         await cartsCollection.updateOne(
           { userId },
@@ -316,13 +805,11 @@ async function run() {
           }
         );
 
-        console.log("✅ Cart cleared");
         res.json({ 
           success: true, 
           message: "Cart cleared" 
         });
       } catch (err) {
-        console.error("❌ Clear cart error:", err);
         res.status(500).json({ 
           success: false,
           message: "Cannot clear cart" 
@@ -340,7 +827,6 @@ async function run() {
 
         res.send({ count });
       } catch (err) {
-        console.error("❌ Cart count error:", err);
         res.status(500).send({ error: "Failed to get cart count" });
       }
     });
@@ -351,10 +837,29 @@ async function run() {
     // ============================================
 
     // GET - Fetch user's wishlist
-    app.get("/api/wishlist/:userId", async (req, res) => {
+    app.get("/api/wishlist/:userId", logger,verifyToken, verifyFirebaseToken, async (req, res) => {
       try {
         const userId = req.params.userId;
-        console.log("📥 GET wishlist for user:", userId);
+        const authenticatedEmail = req.decoded.email;
+
+
+        if(req.tokenEmail != userId){
+          return res.status(403).json({ 
+            error: "Forbidden access: User ID does not match token" 
+          });
+        }
+
+        if (userId !== authenticatedEmail) {
+          return res.status(403).json({ 
+            error: "Forbidden access: User ID does not match token" 
+          });
+        }
+
+        if (!userId) {
+          return res.status(400).json({ 
+            error: "User ID is required" 
+          });
+        }
 
         // Fetch wishlist with product details using aggregation
         const wishlistItems = await wishlistsCollection
@@ -396,10 +901,8 @@ async function run() {
           ])
           .toArray();
 
-        console.log(`✅ Found ${wishlistItems.length} wishlist items`);
         res.send(wishlistItems);
       } catch (err) {
-        console.error("❌ Wishlist fetch error:", err);
         res.status(500).send({ 
           error: "Failed to fetch wishlist",
           message: err.message 
@@ -412,8 +915,6 @@ async function run() {
       try {
         const userId = req.params.userId;
         const { productId } = req.body;
-
-        console.log("🔄 Toggle wishlist - User:", userId, "Product:", productId);
 
         if (!productId) {
           return res.status(400).json({ 
@@ -447,7 +948,6 @@ async function run() {
             productId: productId
           });
 
-          console.log("➖ Removed from wishlist");
           return res.status(200).json({ 
             success: true,
             message: "Product removed from wishlist",
@@ -463,7 +963,6 @@ async function run() {
 
           await wishlistsCollection.insertOne(wishlistItem);
 
-          console.log("➕ Added to wishlist");
           return res.status(201).json({ 
             success: true,
             message: "Product added to wishlist",
@@ -471,7 +970,6 @@ async function run() {
           });
         }
       } catch (err) {
-        console.error("❌ Toggle wishlist error:", err);
         res.status(500).json({ 
           success: false,
           message: "Error toggling wishlist",
@@ -485,8 +983,6 @@ async function run() {
       try {
         const { userId, productId } = req.params;
 
-        console.log("🗑️ Removing from wishlist - User:", userId, "Product:", productId);
-
         const result = await wishlistsCollection.deleteOne({
           userId: userId,
           productId: productId
@@ -499,13 +995,11 @@ async function run() {
           });
         }
 
-        console.log("✅ Item removed from wishlist");
         res.json({ 
           success: true,
           message: "Product removed from wishlist" 
         });
       } catch (err) {
-        console.error("❌ Remove from wishlist error:", err);
         res.status(500).json({ 
           success: false,
           message: "Error removing from wishlist",
@@ -526,7 +1020,6 @@ async function run() {
 
         res.json({ inWishlist: !!existingItem });
       } catch (err) {
-        console.error("❌ Check wishlist error:", err);
         res.status(500).json({ 
           error: "Error checking wishlist",
           message: err.message 
@@ -545,16 +1038,12 @@ async function run() {
 
         res.json({ count });
       } catch (err) {
-        console.error("❌ Wishlist count error:", err);
         res.status(500).json({ 
           error: "Error getting wishlist count",
           message: err.message 
         });
       }
     });
-
-
-
   } catch (err) {
     console.error("❌ MongoDB connection error:", err);
   }
@@ -567,5 +1056,5 @@ app.get("/", async (req, res) => {
 });
 
 app.listen(port, () =>
-  console.log(`🚀 E-Commerce Server Site Is Running on http://localhost:${port}`)
+  console.log(`E-Commerce Server Site Is Running on http://localhost:${port}`)
 );
