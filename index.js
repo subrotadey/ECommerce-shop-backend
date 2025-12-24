@@ -30,16 +30,6 @@ admin.initializeApp({
   credential: admin.credential.cert(serviceAccount)
 });
 
-
-
-
-
-const logger = (req, res, next) => {
-  console.log(`${req.method} ${req.url}`);
-  console.log('inside the logger');
-  next();
-};
-
 const verifyToken = (req, res, next) => {
   const token = req?.cookies?.access_token;
 
@@ -76,9 +66,18 @@ const verifyFirebaseToken = async(req, res, next) => {
   req.tokenEmail = userInfo?.email
   next()
 }
-// app.use(logger);
-// app.use(bodyParser.json());
-// app.use(bodyParser.urlencoded({ extended: true }));
+
+const verifyEmailToken = (req, res, next) => {
+  const userId = req.params.userId;
+  const authenticatedEmail = req.decoded.email;
+
+  if (userId !== authenticatedEmail) {
+          return res.status(403).json({ 
+            error: "Forbidden access: User ID does not match token" 
+          });
+        }
+        next()
+}
 
 // MongoDB connection
 
@@ -595,46 +594,71 @@ app.post("/api/cloudinary/delete/batch", async (req, res) => {
     // ============================================
 
     // GET user cart
-    app.get("/api/cart/:userId", async (req, res) => {
-      try {
-        const userId = req.params.userId;
 
-        const cart = await cartsCollection.findOne({ userId });
+app.get("/api/cart/:userId", async (req, res) => {
+  try {
+    const userId = req.params.userId;
+    console.log('🔍 GET /api/cart/:userId - Fetching cart for:', userId);
 
-        res.send({ items: cart?.items || [] });
-      } catch (err) {
-        res.status(500).send({ error: "Failed to fetch cart" });
-      }
+    const cart = await cartsCollection.findOne({ userId });
+    console.log('📦 Cart found in DB:', cart ? `${cart.items?.length} items` : 'No cart');
+
+    res.json({ 
+      success: true,
+      items: cart?.items || [] 
     });
-
-    // POST/UPDATE full cart
-    app.post("/api/cart/:userId", async (req, res) => {
-      try {
-        const userId = req.params.userId;
-        const items = req.body.items || [];
-
-        // Validate items
-        const validItems = items.filter(item => 
-          item.key && item.productId && item.qty > 0
-        );
-
-
-        const result = await cartsCollection.updateOne(
-          { userId },
-          { 
-            $set: { 
-              items: validItems,
-              updatedAt: new Date()
-            } 
-          },
-          { upsert: true }
-        );
-
-        res.send({ success: true, items: validItems });
-      } catch (err) {
-        res.status(500).send({ error: "Failed to save cart" });
-      }
+  } catch (err) {
+    console.error("❌ GET cart error:", err);
+    res.status(500).json({ 
+      success: false,
+      error: "Failed to fetch cart",
+      items: []
     });
+  }
+});
+
+// POST/UPDATE full cart
+app.post("/api/cart/:userId", async (req, res) => {
+  try {
+    const userId = req.params.userId;
+    const items = req.body.items || [];
+    
+    console.log('💾 POST /api/cart/:userId - Saving cart');
+    console.log('   User:', userId);
+    console.log('   Items to save:', items.length);
+
+    // Validate items
+    const validItems = items.filter(item => 
+      item.key && item.productId && item.qty > 0
+    );
+
+    console.log('   Valid items:', validItems.length);
+
+    const result = await cartsCollection.updateOne(
+      { userId },
+      { 
+        $set: { 
+          items: validItems,
+          updatedAt: new Date()
+        } 
+      },
+      { upsert: true }
+    );
+
+    console.log('✅ Cart saved:', result.modifiedCount || result.upsertedCount ? 'Success' : 'No change');
+
+    res.json({ 
+      success: true, 
+      items: validItems 
+    });
+  } catch (err) {
+    console.error("❌ POST cart error:", err);
+    res.status(500).json({ 
+      success: false,
+      error: "Failed to save cart" 
+    });
+  }
+});
 
     // ADD single item
     app.post("/api/cart/:userId/add", async (req, res) => {
@@ -837,19 +861,11 @@ app.post("/api/cloudinary/delete/batch", async (req, res) => {
     // ============================================
 
     // GET - Fetch user's wishlist
-    app.get("/api/wishlist/:userId", logger,verifyToken, verifyFirebaseToken, async (req, res) => {
+    app.get("/api/wishlist/:userId", verifyToken, verifyFirebaseToken, verifyEmailToken, async (req, res) => {
       try {
         const userId = req.params.userId;
-        const authenticatedEmail = req.decoded.email;
-
 
         if(req.tokenEmail != userId){
-          return res.status(403).json({ 
-            error: "Forbidden access: User ID does not match token" 
-          });
-        }
-
-        if (userId !== authenticatedEmail) {
           return res.status(403).json({ 
             error: "Forbidden access: User ID does not match token" 
           });
