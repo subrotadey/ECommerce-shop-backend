@@ -3,8 +3,6 @@ const express = require("express");
 const cors = require("cors");
 const jwt = require("jsonwebtoken");
 const cookieParser = require("cookie-parser");
-const bodyParser = require("body-parser");
-const crypto = require("crypto");
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 require("dotenv").config();
 const cloudinary = require("cloudinary").v2;
@@ -13,22 +11,56 @@ const port = process.env.PORT || 5000;
 const app = express();
 
 //middleware
+const allowedOrigins = [
+  "http://localhost:5173",
+  "http://localhost:3000",
+  "https://anis-abaiya.web.app",
+  "https://anis-abaiya.firebaseapp.com"
+];
+
 app.use(cors({
-  origin: ['http://localhost:5173'],
+  origin: function (origin, callback) {
+    // Allow requests with no origin (mobile apps, Postman, etc.)
+    if (!origin) return callback(null, true);
+    
+    if (allowedOrigins.indexOf(origin) === -1) {
+      const msg = 'The CORS policy for this site does not allow access from the specified Origin.';
+      return callback(new Error(msg), false);
+    }
+    return callback(null, true);
+  },
   credentials: true,
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+  optionsSuccessStatus: 200
 }));
+
+
 app.use(express.json());
 app.use(cookieParser());
 
 
+const admin = require('firebase-admin');
 
-var admin = require("firebase-admin");
+try {
+  // Base64 decode
+  const decoded = Buffer.from(process.env.FB_SERVICE_KEY, 'base64').toString('utf8');
+  
+  // JSON parse
+  const serviceAccount = JSON.parse(decoded);
+  
+  // Firebase initialize
+  if (!admin.apps.length) {
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount)
+    });
+    console.log('Firebase Admin initialized successfully');
+  }
+} catch (error) {
+  console.error('Firebase initialization error:', error.message);
+  throw error;
+}
 
-var serviceAccount = require("./anis-abaiya-firebase-admin-key.json");
-
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount)
-});
 
 const verifyToken = (req, res, next) => {
   const token = req?.cookies?.access_token;
@@ -102,8 +134,8 @@ cloudinary.config({
 
 async function run() {
   try {
-    await client.connect();
-    console.log("✅ Database connected");
+    // await client.connect();
+    // console.log("✅ Database connected");
 
     const database = client.db("eCommerceDB");
 
@@ -141,28 +173,29 @@ async function run() {
     //   res.send({ token });
     // });
 
-    app.post("/jwt", (req, res) => {
-      const userData = req.body;
+app.post("/jwt", (req, res) => {
+  const userData = req.body;
 
-      const token = jwt.sign(
-        {
-          email: userData.email,
-        }, 
-        process.env.JWT_ACCESS_SECRET, 
-        {
-        expiresIn: "7d",
-      });
+  const token = jwt.sign(
+    {
+      email: userData.email,
+    }, 
+    process.env.JWT_ACCESS_SECRET, 
+    {
+      expiresIn: "7d",
+    }
+  );
 
-      // set the token in an HTTP-only cookie
-      res.cookie('access_token', token, {
-        httpOnly: true,
-        secure: process.env.NODE_ENV === 'production', // use secure cookies in production
-        maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
-        sameSite: 'Lax',
-      });
+  // ✅ Cookie settings ঠিক করুন
+  res.cookie('access_token', token, {
+    httpOnly: true,
+    secure: true,
+    sameSite: 'none',
+    maxAge: 7 * 24 * 60 * 60 * 1000,
+  });
 
-      res.send({success: true});
-    });
+  res.send({success: true});
+});
 
     // ============================================
     // PRODUCTS ROUTES
@@ -860,208 +893,215 @@ app.post("/api/cart/:userId", async (req, res) => {
     // 🆕 WISHLIST ROUTES
     // ============================================
 
-    // GET - Fetch user's wishlist
-    app.get("/api/wishlist/:userId", verifyToken, verifyFirebaseToken, verifyEmailToken, async (req, res) => {
-      try {
-        const userId = req.params.userId;
+// GET - Fetch user's wishlist
+app.get("/api/wishlist/:userId", verifyToken, verifyFirebaseToken, verifyEmailToken, async (req, res) => {
+  try {
+    const userId = req.params.userId;
 
-        if(req.tokenEmail != userId){
-          return res.status(403).json({ 
-            error: "Forbidden access: User ID does not match token" 
-          });
+    if(req.tokenEmail !== userId){
+      return res.status(403).json({ 
+        error: "Forbidden access: User ID does not match token" 
+      });
+    }
+
+    // Fetch wishlist with product details using aggregation
+    const wishlistItems = await wishlistsCollection
+      .aggregate([
+        { 
+          $match: { userId: userId }
+        },
+        {
+          $addFields: {
+            productObjectId: { $toObjectId: "$productId" }
+          }
+        },
+        {
+          $lookup: {
+            from: "products",
+            localField: "productObjectId",
+            foreignField: "_id",
+            as: "productDetails"
+          }
+        },
+        {
+          $unwind: {
+            path: "$productDetails",
+            preserveNullAndEmptyArrays: false
+          }
+        },
+        {
+          $sort: { addedAt: -1 }
+        },
+        {
+          $project: {
+            _id: 1,
+            userId: 1,
+            productId: 1,
+            addedAt: 1,
+            product: "$productDetails"
+          }
         }
+      ])
+      .toArray();
 
-        if (!userId) {
-          return res.status(400).json({ 
-            error: "User ID is required" 
-          });
-        }
-
-        // Fetch wishlist with product details using aggregation
-        const wishlistItems = await wishlistsCollection
-          .aggregate([
-            { 
-              $match: { userId: userId } // Using string userId
-            },
-            {
-              $addFields: {
-                productObjectId: { $toObjectId: "$productId" }
-              }
-            },
-            {
-              $lookup: {
-                from: "products",
-                localField: "productObjectId",
-                foreignField: "_id",
-                as: "productDetails"
-              }
-            },
-            {
-              $unwind: {
-                path: "$productDetails",
-                preserveNullAndEmptyArrays: false
-              }
-            },
-            {
-              $sort: { addedAt: -1 }
-            },
-            {
-              $project: {
-                _id: 1,
-                userId: 1,
-                productId: 1,
-                addedAt: 1,
-                product: "$productDetails"
-              }
-            }
-          ])
-          .toArray();
-
-        res.send(wishlistItems);
-      } catch (err) {
-        res.status(500).send({ 
-          error: "Failed to fetch wishlist",
-          message: err.message 
-        });
-      }
-    });
-
-    // POST - Toggle wishlist (add/remove)
-    app.post("/api/wishlist/:userId/toggle", async (req, res) => {
-      try {
-        const userId = req.params.userId;
-        const { productId } = req.body;
-
-        if (!productId) {
-          return res.status(400).json({ 
-            success: false,
-            message: "Product ID is required" 
-          });
-        }
-
-        // Check if product exists
-        const product = await productsCollection.findOne({ 
-          _id: new ObjectId(productId) 
-        });
-
-        if (!product) {
-          return res.status(404).json({ 
-            success: false,
-            message: "Product not found" 
-          });
-        }
-
-        // Check if already in wishlist
-        const existingItem = await wishlistsCollection.findOne({
-          userId: userId,
-          productId: productId
-        });
-
-        if (existingItem) {
-          // Remove from wishlist
-          await wishlistsCollection.deleteOne({
-            userId: userId,
-            productId: productId
-          });
-
-          return res.status(200).json({ 
-            success: true,
-            message: "Product removed from wishlist",
-            inWishlist: false 
-          });
-        } else {
-          // Add to wishlist
-          const wishlistItem = {
-            userId: userId,
-            productId: productId,
-            addedAt: new Date()
-          };
-
-          await wishlistsCollection.insertOne(wishlistItem);
-
-          return res.status(201).json({ 
-            success: true,
-            message: "Product added to wishlist",
-            inWishlist: true 
-          });
-        }
-      } catch (err) {
-        res.status(500).json({ 
-          success: false,
-          message: "Error toggling wishlist",
-          error: err.message 
-        });
-      }
-    });
-
-    // DELETE - Remove from wishlist
-    app.delete("/api/wishlist/:userId/remove/:productId", async (req, res) => {
-      try {
-        const { userId, productId } = req.params;
-
-        const result = await wishlistsCollection.deleteOne({
-          userId: userId,
-          productId: productId
-        });
-
-        if (result.deletedCount === 0) {
-          return res.status(404).json({ 
-            success: false,
-            message: "Item not found in wishlist" 
-          });
-        }
-
-        res.json({ 
-          success: true,
-          message: "Product removed from wishlist" 
-        });
-      } catch (err) {
-        res.status(500).json({ 
-          success: false,
-          message: "Error removing from wishlist",
-          error: err.message 
-        });
-      }
-    });
-
-    // GET - Check if product is in wishlist
-    app.get("/api/wishlist/:userId/check/:productId", async (req, res) => {
-      try {
-        const { userId, productId } = req.params;
-
-        const existingItem = await wishlistsCollection.findOne({
-          userId: userId,
-          productId: productId
-        });
-
-        res.json({ inWishlist: !!existingItem });
-      } catch (err) {
-        res.status(500).json({ 
-          error: "Error checking wishlist",
-          message: err.message 
-        });
-      }
-    });
-
-    // GET - Get wishlist count
-    app.get("/api/wishlist/:userId/count", async (req, res) => {
-      try {
-        const userId = req.params.userId;
-
-        const count = await wishlistsCollection.countDocuments({
-          userId: userId
-        });
-
-        res.json({ count });
-      } catch (err) {
-        res.status(500).json({ 
-          error: "Error getting wishlist count",
-          message: err.message 
-        });
-      }
+    res.json({ 
+      success: true,
+      items: wishlistItems 
     });
   } catch (err) {
-    console.error("❌ MongoDB connection error:", err);
+    res.status(500).json({ 
+      success: false,
+      error: "Failed to fetch wishlist",
+      message: err.message 
+    });
+  }
+});
+
+// POST - Toggle wishlist (add/remove) - PUBLIC for easier access
+app.post("/api/wishlist/:userId/toggle", async (req, res) => {
+  try {
+    const userId = req.params.userId;
+    const { productId } = req.body;
+
+    if (!productId) {
+      return res.status(400).json({ 
+        success: false,
+        message: "Product ID is required" 
+      });
+    }
+
+    // Check if product exists
+    const product = await productsCollection.findOne({ 
+      _id: new ObjectId(productId) 
+    });
+
+    if (!product) {
+      return res.status(404).json({ 
+        success: false,
+        message: "Product not found" 
+      });
+    }
+
+    // Check if already in wishlist
+    const existingItem = await wishlistsCollection.findOne({
+      userId: userId,
+      productId: productId
+    });
+
+    if (existingItem) {
+      // Remove from wishlist
+      await wishlistsCollection.deleteOne({
+        userId: userId,
+        productId: productId
+      });
+
+      return res.status(200).json({ 
+        success: true,
+        message: "Product removed from wishlist",
+        inWishlist: false 
+      });
+    } else {
+      // Add to wishlist
+      const wishlistItem = {
+        userId: userId,
+        productId: productId,
+        addedAt: new Date()
+      };
+
+      await wishlistsCollection.insertOne(wishlistItem);
+
+      return res.status(201).json({ 
+        success: true,
+        message: "Product added to wishlist",
+        inWishlist: true 
+      });
+    }
+  } catch (err) {
+    res.status(500).json({ 
+      success: false,
+      message: "Error toggling wishlist",
+      error: err.message 
+    });
+  }
+});
+
+// DELETE - Remove from wishlist - PUBLIC
+app.delete("/api/wishlist/:userId/remove/:productId", async (req, res) => {
+  try {
+    const { userId, productId } = req.params;
+
+    const result = await wishlistsCollection.deleteOne({
+      userId: userId,
+      productId: productId
+    });
+
+    if (result.deletedCount === 0) {
+      return res.status(404).json({ 
+        success: false,
+        message: "Item not found in wishlist" 
+      });
+    }
+
+    res.json({ 
+      success: true,
+      message: "Product removed from wishlist" 
+    });
+  } catch (err) {
+    res.status(500).json({ 
+      success: false,
+      message: "Error removing from wishlist",
+      error: err.message 
+    });
+  }
+});
+
+// GET - Check if product is in wishlist - PUBLIC (no auth needed)
+app.get("/api/wishlist/:userId/check/:productId", async (req, res) => {
+  try {
+    const { userId, productId } = req.params;
+
+    const existingItem = await wishlistsCollection.findOne({
+      userId: userId,
+      productId: productId
+    });
+
+    res.json({ 
+      success: true,
+      inWishlist: !!existingItem 
+    });
+  } catch (err) {
+    res.status(500).json({ 
+      success: false,
+      error: "Error checking wishlist",
+      message: err.message 
+    });
+  }
+});
+
+// GET - Get wishlist count - PUBLIC (no auth needed)
+app.get("/api/wishlist/:userId/count", async (req, res) => {
+  try {
+    const userId = req.params.userId;
+
+    const count = await wishlistsCollection.countDocuments({
+      userId: userId
+    });
+
+    res.json({ 
+      success: true,
+      count 
+    });
+  } catch (err) {
+    res.status(500).json({ 
+      success: false,
+      error: "Error getting wishlist count",
+      message: err.message 
+    });
+  }
+});
+    
+  } catch (err) {
+    console.error("MongoDB connection error:", err);
   }
 }
 
