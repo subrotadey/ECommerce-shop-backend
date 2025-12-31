@@ -40,12 +40,14 @@ app.use(express.json());
 app.use(cookieParser());
 
 
+// ============================================
+// FIREBASE ADMIN INITIALIZATION
+// ============================================
 const admin = require('firebase-admin');
 
 try {
   // Base64 decode
   const decoded = Buffer.from(process.env.FB_SERVICE_KEY, 'base64').toString('utf8');
-  
   // JSON parse
   const serviceAccount = JSON.parse(decoded);
   
@@ -61,6 +63,11 @@ try {
   throw error;
 }
 
+// ============================================
+// AUTHENTICATION MIDDLEWARE
+// ============================================
+
+// JWT Token verification (for cookie-based auth)
 
 const verifyToken = (req, res, next) => {
   const token = req?.cookies?.access_token;
@@ -80,24 +87,134 @@ const verifyToken = (req, res, next) => {
       });
     }
     req.decoded = decoded;
-    // console.log('Decoded JWT:', decoded);
     next();
   });
 }
 
-const verifyFirebaseToken = async(req, res, next) => {
-  const authHeader = req?.headers?.authorization;
-  const token = authHeader.split(' ')[1]
-  if(!token){
-    return res.status(401).json({ 
+// Firebase Token verification (for Authorization header)
+const verifyFirebaseToken = async (req, res, next) => {
+  try {
+    const authHeader = req?.headers?.authorization;
+    
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ 
+        success: false,
+        message: "No token provided. Authorization header must be in format: Bearer <token>" 
+      });
+    }
+
+    const token = authHeader.split(' ')[1];
+    
+    // Verify Firebase ID token
+    const decodedToken = await admin.auth().verifyIdToken(token);
+    
+    // Attach user info to request
+    req.uid = decodedToken.uid;
+    req.tokenEmail = decodedToken.email;
+    req.emailVerified = decodedToken.email_verified;
+    
+    next();
+  } catch (error) {
+    console.error('Token verification error:', error);
+    
+    if (error.code === 'auth/id-token-expired') {
+      return res.status(401).json({
+        success: false,
+        message: 'Token expired. Please login again.'
+      });
+    }
+    
+    return res.status(401).json({
       success: false,
-      message: "Unauthorized access, token missing" 
+      message: 'Invalid or expired token',
+      error: error.message
     });
   }
-  const userInfo = await admin.auth().verifyIdToken(token);
-  req.tokenEmail = userInfo?.email
-  next()
-}
+};
+
+
+
+// Admin role verification
+const verifyAdmin = async (req, res, next) => {
+  try {
+    const email = req.tokenEmail;
+    
+    if (!email) {
+      return res.status(401).json({
+        success: false,
+        message: 'Authentication required'
+      });
+    }
+
+    const user = await usersCollection.findOne({ email: email.toLowerCase() });
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: 'User not found'
+      });
+    }
+
+    if (user.role !== 'admin') {
+      return res.status(403).json({
+        success: false,
+        message: 'Admin access required'
+      });
+    }
+
+    req.user = user;
+    next();
+  } catch (error) {
+    console.error('Admin verification error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error verifying admin access',
+      error: error.message
+    });
+  }
+};
+
+// Staff role verification middleware
+const verifyStaff = async (req, res, next) => {
+  try {
+    const email = req.tokenEmail;
+    
+    if (!email) {
+      return res.status(401).json({
+        success: false,
+        message: 'Authentication required'
+      });
+    }
+
+    const user = await usersCollection.findOne({ email: email.toLowerCase() });
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: 'User not found'
+      });
+    }
+
+    // Admin অথবা Staff - দুজনেই access পাবে
+    if (user.role !== 'admin' && user.role !== 'staff') {
+      return res.status(403).json({
+        success: false,
+        message: 'Staff or Admin access required'
+      });
+    }
+
+    req.user = user;
+    next();
+  } catch (error) {
+    console.error('Staff verification error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error verifying staff access',
+      error: error.message
+    });
+  }
+};
+
 
 const verifyEmailToken = (req, res, next) => {
   const userId = req.params.userId;
@@ -111,8 +228,8 @@ const verifyEmailToken = (req, res, next) => {
         next()
 }
 
-// MongoDB connection
 
+// MongoDB connection
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.hs9qs.mongodb.net/?retryWrites=true&w=majority`;
 
 const client = new MongoClient(uri, {
@@ -134,8 +251,7 @@ cloudinary.config({
 
 async function run() {
   try {
-    // await client.connect();
-    // console.log("✅ Database connected");
+    await client.connect();
 
     const database = client.db("eCommerceDB");
 
@@ -143,6 +259,10 @@ async function run() {
     const productsCollection = database.collection("products");
     const cartsCollection = database.collection("carts");
     const wishlistsCollection = database.collection("wishlists")
+    const usersCollection = database.collection("users")
+    const ordersCollection = database.collection("orders");
+
+    console.log("All collections initialized");
 
     // ============================================
     // JWT VERIFICATION MIDDLEWARE
@@ -186,7 +306,7 @@ app.post("/jwt", (req, res) => {
     }
   );
 
-  // ✅ Cookie settings ঠিক করুন
+  // ✅ Cookie settings
   res.cookie('access_token', token, {
     httpOnly: true,
     secure: true,
@@ -196,6 +316,534 @@ app.post("/jwt", (req, res) => {
 
   res.send({success: true});
 });
+
+
+    // ============================================
+    // 🆕 USER MANAGEMENT ROUTES
+    // ============================================
+
+    // POST - Register or update user (called after Firebase auth)
+    app.post("/api/users/register", verifyFirebaseToken, async (req, res) => {
+      try {
+        const { uid, email, displayName, photoURL, emailVerified, provider } = req.body;
+
+        // Validate required fields
+        if (!uid || !email) {
+          return res.status(400).json({
+            success: false,
+            message: 'UID and email are required',
+          });
+        }
+
+        // Check if user already exists
+        let user = await usersCollection.findOne({ uid });
+
+        if (user) {
+          // Update existing user
+          const updateData = {
+            displayName: displayName || user.displayName,
+            photoURL: photoURL || user.photoURL,
+            emailVerified: emailVerified !== undefined ? emailVerified : user.emailVerified,
+            lastLogin: new Date(),
+            updatedAt: new Date()
+          };
+
+          await usersCollection.updateOne(
+            { uid },
+            { $set: updateData }
+          );
+
+          const updatedUser = await usersCollection.findOne({ uid });
+
+          return res.status(200).json({
+            success: true,
+            message: 'User updated successfully',
+            user: updatedUser,
+          });
+        }
+
+        // Create new user
+        const newUser = {
+          uid,
+          email: email.toLowerCase(),
+          displayName: displayName || email.split('@')[0],
+          photoURL: photoURL || '',
+          emailVerified: emailVerified || false,
+          provider: provider || 'password',
+          role: 'user',  // Default role
+          phoneNumber: '',
+          address: {
+            street: '',
+            city: '',
+            state: '',
+            zipCode: '',
+            country: ''
+          },
+          isActive: true,
+          lastLogin: new Date(),
+          preferences: {
+            newsletter: false,
+            notifications: true
+          },
+          createdAt: new Date(),
+          updatedAt: new Date()
+        };
+
+        await usersCollection.insertOne(newUser);
+
+        res.status(201).json({
+          success: true,
+          message: 'User registered successfully',
+          user: newUser,
+        });
+      } catch (error) {
+        console.error('Register user error:', error);
+        
+        if (error.code === 11000) {
+          return res.status(400).json({
+            success: false,
+            message: 'User already exists with this email or UID',
+          });
+        }
+
+        res.status(500).json({
+          success: false,
+          message: 'Failed to register user',
+          error: error.message,
+        });
+      }
+    });
+
+    // GET - Get user profile with order history
+    app.get("/api/users/profile/full", verifyFirebaseToken, async (req, res) => {
+      try {
+        const user = await usersCollection.findOne({ uid: req.uid });
+      
+        if (!user) {
+          return res.status(404).json({
+            success: false,
+            message: 'User not found',
+          });
+        }
+      
+        // Initialize default values
+        let recentOrders = [];
+        let ordersCount = 0;
+
+        // Try to get orders (orders collection may not exist yet)
+        try {
+          recentOrders = await ordersCollection
+            .find({ 
+              $or: [
+                { userId: user.uid },
+                { 'customer.email': user.email }
+              ]
+            })
+            .sort({ createdAt: -1 })
+            .limit(10)
+            .toArray();
+          
+          ordersCount = await ordersCollection.countDocuments({
+            $or: [
+              { userId: user.uid },
+              { 'customer.email': user.email }
+            ]
+          });
+        } catch (orderError) {
+          console.log('Orders collection not found or empty:', orderError.message);
+          // Continue with empty orders
+        }
+      
+        // Get wishlist count
+        let wishlistCount = 0;
+        try {
+          wishlistCount = await wishlistsCollection.countDocuments({
+            userId: user.email
+          });
+        } catch (wishlistError) {
+          console.log('Wishlist error:', wishlistError.message);
+        }
+      
+        // Update last login
+        await usersCollection.updateOne(
+          { uid: req.uid },
+          { $set: { lastLogin: new Date() } }
+        );
+      
+        res.status(200).json({
+          success: true,
+          user: {
+            ...user,
+            recentOrders: recentOrders,
+            wishlistCount: wishlistCount,
+            ordersCount: ordersCount
+          },
+        });
+      } catch (error) {
+        console.error('Get full profile error:', error);
+        res.status(500).json({
+          success: false,
+          message: 'Failed to fetch user profile',
+          error: error.message,
+        });
+      }
+    });
+
+    // PATCH - Update user profile
+    app.patch("/api/users/profile", verifyFirebaseToken, async (req, res) => {
+      try {
+        const { displayName, photoURL, phoneNumber, address, preferences } = req.body;
+
+        const user = await usersCollection.findOne({ uid: req.uid });
+
+        if (!user) {
+          return res.status(404).json({
+            success: false,
+            message: 'User not found',
+          });
+        }
+
+        // Build update object
+        const updateData = { updatedAt: new Date() };
+        
+        if (displayName) updateData.displayName = displayName;
+        if (photoURL) updateData.photoURL = photoURL;
+        if (phoneNumber) updateData.phoneNumber = phoneNumber;
+        if (address) updateData.address = { ...user.address, ...address };
+        if (preferences) updateData.preferences = { ...user.preferences, ...preferences };
+
+        await usersCollection.updateOne(
+          { uid: req.uid },
+          { $set: updateData }
+        );
+
+        const updatedUser = await usersCollection.findOne({ uid: req.uid });
+
+        res.status(200).json({
+          success: true,
+          message: 'Profile updated successfully',
+          user: updatedUser,
+        });
+      } catch (error) {
+        console.error('Update profile error:', error);
+        res.status(500).json({
+          success: false,
+          message: 'Failed to update profile',
+          error: error.message,
+        });
+      }
+    });
+
+    // GET - Get user role by email (for frontend role checking)
+    app.get("/api/users/role/:email", async (req, res) => {
+      try {
+        const { email } = req.params;
+
+        if (!email) {
+          return res.status(400).json({
+            success: false,
+            message: 'Email is required',
+          });
+        }
+
+        const user = await usersCollection.findOne({ 
+          email: email.toLowerCase() 
+        });
+
+        if (!user) {
+          return res.status(404).json({
+            success: false,
+            message: 'User not found',
+          });
+        }
+
+        res.status(200).json({
+          success: true,
+          role: user.role,
+        });
+      } catch (error) {
+        console.error('Get user role error:', error);
+        res.status(500).json({
+          success: false,
+          message: 'Failed to fetch user role',
+          error: error.message,
+        });
+      }
+    });
+
+    // GET - Get all users (Admin only)
+    app.get("/api/users", verifyFirebaseToken, verifyAdmin, async (req, res) => {
+      try {
+        const { page = 1, limit = 10, role, search } = req.query;
+
+        const query = {};
+        
+        if (role) query.role = role;
+        if (search) {
+          query.$or = [
+            { displayName: { $regex: search, $options: 'i' } },
+            { email: { $regex: search, $options: 'i' } },
+          ];
+        }
+
+        const users = await usersCollection.find(query)
+          .limit(limit * 1)
+          .skip((page - 1) * limit)
+          .sort({ createdAt: -1 })
+          .toArray();
+
+        const count = await usersCollection.countDocuments(query);
+
+        res.status(200).json({
+          success: true,
+          users,
+          totalPages: Math.ceil(count / limit),
+          currentPage: parseInt(page),
+          total: count,
+        });
+      } catch (error) {
+        console.error('Get all users error:', error);
+        res.status(500).json({
+          success: false,
+          message: 'Failed to fetch users',
+          error: error.message,
+        });
+      }
+    });
+
+    // PATCH - Update user role (Admin only)
+    app.patch("/api/users/:userId/role", verifyFirebaseToken, verifyAdmin, async (req, res) => {
+      try {
+        const { userId } = req.params;
+        const { role } = req.body;
+
+        if (!['user', 'admin', 'staff'].includes(role)) {
+          return res.status(400).json({
+            success: false,
+            message: 'Invalid role. Must be user, admin, or staff',
+          });
+        }
+
+        const result = await usersCollection.updateOne(
+          { _id: new ObjectId(userId) },
+          { 
+            $set: { 
+              role,
+              updatedAt: new Date()
+            } 
+          }
+        );
+
+        if (result.matchedCount === 0) {
+          return res.status(404).json({
+            success: false,
+            message: 'User not found',
+          });
+        }
+
+        const updatedUser = await usersCollection.findOne({ 
+          _id: new ObjectId(userId) 
+        });
+
+        res.status(200).json({
+          success: true,
+          message: 'User role updated successfully',
+          user: updatedUser,
+        });
+      } catch (error) {
+        console.error('Update user role error:', error);
+        res.status(500).json({
+          success: false,
+          message: 'Failed to update user role',
+          error: error.message,
+        });
+      }
+    });
+
+    // DELETE - Delete user (Admin only)
+    app.delete("/api/users/:userId", verifyFirebaseToken, verifyAdmin, async (req, res) => {
+      try {
+        const { userId } = req.params;
+
+        const user = await usersCollection.findOne({ 
+          _id: new ObjectId(userId) 
+        });
+
+        if (!user) {
+          return res.status(404).json({
+            success: false,
+            message: 'User not found',
+          });
+        }
+
+        // Delete from Firebase Auth
+        try {
+          await admin.auth().deleteUser(user.uid);
+        } catch (firebaseError) {
+          console.error('Firebase deletion error:', firebaseError);
+        }
+
+        // Delete from database
+        await usersCollection.deleteOne({ _id: new ObjectId(userId) });
+
+        res.status(200).json({
+          success: true,
+          message: 'User deleted successfully',
+        });
+      } catch (error) {
+        console.error('Delete user error:', error);
+        res.status(500).json({
+          success: false,
+          message: 'Failed to delete user',
+          error: error.message,
+        });
+      }
+    });
+
+    // ============================================
+// USER STATISTICS (Admin Only)
+// ============================================
+
+// GET - Get user statistics
+app.get("/api/admin/stats/users", verifyFirebaseToken, verifyAdmin, async (req, res) => {
+  try {
+    const totalUsers = await usersCollection.countDocuments();
+    const adminCount = await usersCollection.countDocuments({ role: 'admin' });
+    const staffCount = await usersCollection.countDocuments({ role: 'staff' });
+    const regularUsers = await usersCollection.countDocuments({ role: 'user' });
+
+    // Active users (logged in last 30 days)
+    const thirtyDaysAgo = new Date();
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+    
+    const activeUsers = await usersCollection.countDocuments({
+      lastLogin: { $gte: thirtyDaysAgo }
+    });
+
+    // New users this month
+    const firstDayOfMonth = new Date();
+    firstDayOfMonth.setDate(1);
+    firstDayOfMonth.setHours(0, 0, 0, 0);
+    
+    const newUsersThisMonth = await usersCollection.countDocuments({
+      createdAt: { $gte: firstDayOfMonth }
+    });
+
+    res.status(200).json({
+      success: true,
+      stats: {
+        totalUsers,
+        adminCount,
+        staffCount,
+        regularUsers,
+        activeUsers,
+        newUsersThisMonth
+      }
+    });
+  } catch (error) {
+    console.error('Get user stats error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch user statistics',
+      error: error.message,
+    });
+  }
+});
+
+// ============================================
+// BATCH UPDATE USER ROLES (Admin Only)
+// ============================================
+
+// POST - Batch update user roles
+app.post("/api/admin/users/batch-role", verifyFirebaseToken, verifyAdmin, async (req, res) => {
+  try {
+    const { userIds, role } = req.body;
+
+    if (!Array.isArray(userIds) || userIds.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'User IDs array is required'
+      });
+    }
+
+    if (!['user', 'admin', 'staff'].includes(role)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid role. Must be user, admin, or staff'
+      });
+    }
+
+    const objectIds = userIds.map(id => new ObjectId(id));
+
+    const result = await usersCollection.updateMany(
+      { _id: { $in: objectIds } },
+      { 
+        $set: { 
+          role,
+          updatedAt: new Date()
+        } 
+      }
+    );
+
+    res.status(200).json({
+      success: true,
+      message: `${result.modifiedCount} users updated successfully`,
+      modifiedCount: result.modifiedCount
+    });
+  } catch (error) {
+    console.error('Batch role update error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to update user roles',
+      error: error.message,
+    });
+  }
+});
+
+    // ============================================
+// EXAMPLE: STAFF PROTECTED ROUTE
+// ============================================
+
+// GET - Get all orders (Staff/Admin can access)
+app.get("/api/orders", verifyFirebaseToken, verifyStaff, async (req, res) => {
+  try {
+    const { page = 1, limit = 10, status, search } = req.query;
+
+    const query = {};
+    
+    if (status) query.status = status;
+    if (search) {
+      query.$or = [
+        { orderId: { $regex: search, $options: 'i' } },
+        { 'customer.email': { $regex: search, $options: 'i' } },
+      ];
+    }
+
+    const orders = await ordersCollection.find(query)
+      .limit(limit * 1)
+      .skip((page - 1) * limit)
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    const count = await ordersCollection.countDocuments(query);
+
+    res.status(200).json({
+      success: true,
+      orders,
+      totalPages: Math.ceil(count / limit),
+      currentPage: parseInt(page),
+      total: count,
+    });
+  } catch (error) {
+    console.error('Get orders error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch orders',
+      error: error.message,
+    });
+  }
+});
+
 
     // ============================================
     // PRODUCTS ROUTES
@@ -239,18 +887,12 @@ app.post("/jwt", (req, res) => {
     });
 
 
-
-
-    // ============================================
-// 🆕 NEW ROUTES - ADD THESE BELOW
-// ============================================
-
-    // POST - Create new product (IMPROVED VALIDATION)
+    // POST - Create new product
 app.post("/api/products", async (req, res) => {
   try {
     const productData = req.body;
 
-    // ✅ Validate required fields
+    // Validate required fields
     const requiredFields = ['sku', 'productName', 'newPrice', 'stock'];
     for (const field of requiredFields) {
       if (!productData[field]) {
@@ -261,7 +903,7 @@ app.post("/api/products", async (req, res) => {
       }
     }
 
-    // ✅ NEW: Validate images array
+    // Validate images array
     if (!productData.images || !Array.isArray(productData.images) || productData.images.length === 0) {
       return res.status(400).json({ 
         success: false,
@@ -269,7 +911,7 @@ app.post("/api/products", async (req, res) => {
       });
     }
 
-    // ✅ NEW: Validate price values
+    // Validate price values
     if (productData.newPrice <= 0) {
       return res.status(400).json({ 
         success: false,
@@ -284,7 +926,7 @@ app.post("/api/products", async (req, res) => {
       });
     }
 
-    // ✅ NEW: Validate stock
+    // Validate stock
     if (productData.stock < 0) {
       return res.status(400).json({ 
         success: false,
@@ -461,10 +1103,6 @@ app.post("/api/products", async (req, res) => {
 // CLOUDINARY DELETE ROUTES (ADD THESE)
 // ============================================
 
-    // ============================================
-// CLOUDINARY DELETE ROUTES (FIXED VERSION)
-// ============================================
-
 // DELETE single image from Cloudinary
 app.delete("/api/cloudinary/delete/image", async (req, res) => {
   try {
@@ -631,17 +1269,14 @@ app.post("/api/cloudinary/delete/batch", async (req, res) => {
 app.get("/api/cart/:userId", async (req, res) => {
   try {
     const userId = req.params.userId;
-    console.log('🔍 GET /api/cart/:userId - Fetching cart for:', userId);
-
     const cart = await cartsCollection.findOne({ userId });
-    console.log('📦 Cart found in DB:', cart ? `${cart.items?.length} items` : 'No cart');
 
     res.json({ 
       success: true,
       items: cart?.items || [] 
     });
   } catch (err) {
-    console.error("❌ GET cart error:", err);
+    console.error("GET cart error:", err);
     res.status(500).json({ 
       success: false,
       error: "Failed to fetch cart",
@@ -893,13 +1528,16 @@ app.post("/api/cart/:userId", async (req, res) => {
     // 🆕 WISHLIST ROUTES
     // ============================================
 
+
 // GET - Fetch user's wishlist
-app.get("/api/wishlist/:userId", verifyToken, verifyFirebaseToken, verifyEmailToken, async (req, res) => {
+app.get("/api/wishlist/:userId", verifyFirebaseToken, async (req, res) => {
   try {
     const userId = req.params.userId;
 
+    // Firebase token থেকে email verify করুন
     if(req.tokenEmail !== userId){
       return res.status(403).json({ 
+        success: false,
         error: "Forbidden access: User ID does not match token" 
       });
     }
@@ -944,11 +1582,12 @@ app.get("/api/wishlist/:userId", verifyToken, verifyFirebaseToken, verifyEmailTo
       ])
       .toArray();
 
-    res.json({ 
+    res.json({
       success: true,
-      items: wishlistItems 
+      data: wishlistItems
     });
   } catch (err) {
+    console.error('Wishlist fetch error:', err);
     res.status(500).json({ 
       success: false,
       error: "Failed to fetch wishlist",
@@ -957,11 +1596,19 @@ app.get("/api/wishlist/:userId", verifyToken, verifyFirebaseToken, verifyEmailTo
   }
 });
 
-// POST - Toggle wishlist (add/remove) - PUBLIC for easier access
-app.post("/api/wishlist/:userId/toggle", async (req, res) => {
+// POST - Toggle wishlist (add/remove)
+app.post("/api/wishlist/:userId/toggle", verifyFirebaseToken, async (req, res) => {
   try {
     const userId = req.params.userId;
     const { productId } = req.body;
+
+    // Firebase token verify
+    if(req.tokenEmail !== userId){
+      return res.status(403).json({ 
+        success: false,
+        message: "Forbidden access" 
+      });
+    }
 
     if (!productId) {
       return res.status(400).json({ 
@@ -1017,6 +1664,7 @@ app.post("/api/wishlist/:userId/toggle", async (req, res) => {
       });
     }
   } catch (err) {
+    console.error('Wishlist toggle error:', err);
     res.status(500).json({ 
       success: false,
       message: "Error toggling wishlist",
@@ -1025,10 +1673,18 @@ app.post("/api/wishlist/:userId/toggle", async (req, res) => {
   }
 });
 
-// DELETE - Remove from wishlist - PUBLIC
-app.delete("/api/wishlist/:userId/remove/:productId", async (req, res) => {
+// DELETE - Remove from wishlist
+app.delete("/api/wishlist/:userId/remove/:productId", verifyFirebaseToken, async (req, res) => {
   try {
     const { userId, productId } = req.params;
+
+    // Firebase token verify
+    if(req.tokenEmail !== userId){
+      return res.status(403).json({ 
+        success: false,
+        message: "Forbidden access" 
+      });
+    }
 
     const result = await wishlistsCollection.deleteOne({
       userId: userId,
@@ -1047,6 +1703,7 @@ app.delete("/api/wishlist/:userId/remove/:productId", async (req, res) => {
       message: "Product removed from wishlist" 
     });
   } catch (err) {
+    console.error('Wishlist remove error:', err);
     res.status(500).json({ 
       success: false,
       message: "Error removing from wishlist",
@@ -1055,10 +1712,18 @@ app.delete("/api/wishlist/:userId/remove/:productId", async (req, res) => {
   }
 });
 
-// GET - Check if product is in wishlist - PUBLIC (no auth needed)
-app.get("/api/wishlist/:userId/check/:productId", async (req, res) => {
+// GET - Check if product is in wishlist
+app.get("/api/wishlist/:userId/check/:productId", verifyFirebaseToken, async (req, res) => {
   try {
     const { userId, productId } = req.params;
+
+    // Firebase token verify
+    if(req.tokenEmail !== userId){
+      return res.status(403).json({ 
+        success: false,
+        message: "Forbidden access" 
+      });
+    }
 
     const existingItem = await wishlistsCollection.findOne({
       userId: userId,
@@ -1070,6 +1735,7 @@ app.get("/api/wishlist/:userId/check/:productId", async (req, res) => {
       inWishlist: !!existingItem 
     });
   } catch (err) {
+    console.error('Wishlist check error:', err);
     res.status(500).json({ 
       success: false,
       error: "Error checking wishlist",
@@ -1078,10 +1744,18 @@ app.get("/api/wishlist/:userId/check/:productId", async (req, res) => {
   }
 });
 
-// GET - Get wishlist count - PUBLIC (no auth needed)
-app.get("/api/wishlist/:userId/count", async (req, res) => {
+// GET - Get wishlist count
+app.get("/api/wishlist/:userId/count", verifyFirebaseToken, async (req, res) => {
   try {
     const userId = req.params.userId;
+
+    // Firebase token verify
+    if(req.tokenEmail !== userId){
+      return res.status(403).json({ 
+        success: false,
+        message: "Forbidden access" 
+      });
+    }
 
     const count = await wishlistsCollection.countDocuments({
       userId: userId
@@ -1092,6 +1766,7 @@ app.get("/api/wishlist/:userId/count", async (req, res) => {
       count 
     });
   } catch (err) {
+    console.error('Wishlist count error:', err);
     res.status(500).json({ 
       success: false,
       error: "Error getting wishlist count",
