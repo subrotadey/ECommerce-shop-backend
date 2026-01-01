@@ -6,17 +6,23 @@ const cookieParser = require("cookie-parser");
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 require("dotenv").config();
 const cloudinary = require("cloudinary").v2;
+const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
 const port = process.env.PORT || 5000;
 
 const app = express();
 
-//middleware
+// ============================================
+// CORS CONFIGURATION
+// ============================================
 const allowedOrigins = [
   "http://localhost:5173",
   "http://localhost:3000",
+  process.env.CLIENT_URL, // Add from env
   "https://anis-abaiya.web.app",
   "https://anis-abaiya.firebaseapp.com"
-];
+].filter(Boolean); // Remove undefined values
+
+
 
 app.use(cors({
   origin: function (origin, callback) {
@@ -35,9 +41,68 @@ app.use(cors({
   optionsSuccessStatus: 200
 }));
 
+app.use(cookieParser());
+
+// Add this BEFORE express.json() middleware
+app.post("/api/webhook", 
+  express.raw({ type: 'application/json' }), 
+  async (req, res) => {
+    const sig = req.headers['stripe-signature'];
+    let event;
+
+    try {
+      event = stripe.webhooks.constructEvent(
+        req.body,
+        sig,
+        process.env.STRIPE_WEBHOOK_SECRET
+      );
+    } catch (err) {
+      console.error('Webhook signature verification failed:', err.message);
+      return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    console.log('Webhook received:', event.type);
+
+    // Handle the event
+    switch (event.type) {
+      case 'checkout.session.completed':
+        const session = event.data.object;
+        await handleSuccessfulPayment(session);
+        break;
+
+      case 'checkout.session.expired':
+        console.log('Checkout session expired:', event.data.object.id);
+        break;
+
+      case 'payment_intent.succeeded':
+        console.log('Payment succeeded:', event.data.object.id);
+        break;
+
+      case 'payment_intent.payment_failed':
+        console.log('Payment failed:', event.data.object.id);
+        break;
+
+      default:
+        console.log(`Unhandled event type: ${event.type}`);
+    }
+
+    res.json({ received: true });
+  }
+);
+
+
 
 app.use(express.json());
-app.use(cookieParser());
+
+// ============================================
+// CLOUDINARY CONFIGURATION
+// ============================================
+
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET
+});
 
 
 // ============================================
@@ -91,7 +156,7 @@ const verifyToken = (req, res, next) => {
   });
 }
 
-// Firebase Token verification (for Authorization header)
+// Firebase Token verification
 const verifyFirebaseToken = async (req, res, next) => {
   try {
     const authHeader = req?.headers?.authorization;
@@ -99,7 +164,7 @@ const verifyFirebaseToken = async (req, res, next) => {
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
       return res.status(401).json({ 
         success: false,
-        message: "No token provided. Authorization header must be in format: Bearer <token>" 
+        message: "No token provided" 
       });
     }
 
@@ -115,7 +180,7 @@ const verifyFirebaseToken = async (req, res, next) => {
     
     next();
   } catch (error) {
-    console.error('Token verification error:', error);
+    console.error('Token verification error:', error.code);
     
     if (error.code === 'auth/id-token-expired') {
       return res.status(401).json({
@@ -126,15 +191,14 @@ const verifyFirebaseToken = async (req, res, next) => {
     
     return res.status(401).json({
       success: false,
-      message: 'Invalid or expired token',
+      message: 'Invalid token',
       error: error.message
     });
   }
 };
 
 
-
-// Admin role verification
+// Admin verification
 const verifyAdmin = async (req, res, next) => {
   try {
     const email = req.tokenEmail;
@@ -146,16 +210,11 @@ const verifyAdmin = async (req, res, next) => {
       });
     }
 
-    const user = await usersCollection.findOne({ email: email.toLowerCase() });
+    const user = await usersCollection.findOne({ 
+      email: email.toLowerCase() 
+    });
 
-    if (!user) {
-      return res.status(404).json({
-        success: false,
-        message: 'User not found'
-      });
-    }
-
-    if (user.role !== 'admin') {
+    if (!user || user.role !== 'admin') {
       return res.status(403).json({
         success: false,
         message: 'Admin access required'
@@ -174,7 +233,7 @@ const verifyAdmin = async (req, res, next) => {
   }
 };
 
-// Staff role verification middleware
+// Staff verification
 const verifyStaff = async (req, res, next) => {
   try {
     const email = req.tokenEmail;
@@ -186,17 +245,11 @@ const verifyStaff = async (req, res, next) => {
       });
     }
 
-    const user = await usersCollection.findOne({ email: email.toLowerCase() });
+    const user = await usersCollection.findOne({ 
+      email: email.toLowerCase() 
+    });
 
-    if (!user) {
-      return res.status(404).json({
-        success: false,
-        message: 'User not found'
-      });
-    }
-
-    // Admin অথবা Staff - দুজনেই access পাবে
-    if (user.role !== 'admin' && user.role !== 'staff') {
+    if (!user || (user.role !== 'admin' && user.role !== 'staff')) {
       return res.status(403).json({
         success: false,
         message: 'Staff or Admin access required'
@@ -242,12 +295,7 @@ const client = new MongoClient(uri, {
   socketTimeoutMS: 45000,
 });
 
-// Configure Cloudinary (add after MongoDB setup)
-cloudinary.config({
-  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
-  api_key: process.env.CLOUDINARY_API_KEY,
-  api_secret: process.env.CLOUDINARY_API_SECRET
-});
+
 
 async function run() {
   try {
@@ -293,6 +341,19 @@ async function run() {
     //   res.send({ token });
     // });
 
+    // ============================================
+    // ROUTES
+    // ============================================
+
+    // Health check
+    app.get("/", (req, res) => {
+      res.json({ 
+        success: true,
+        message: "E-Commerce Server is running",
+        timestamp: new Date().toISOString()
+      });
+    });
+
 app.post("/jwt", (req, res) => {
   const userData = req.body;
 
@@ -306,7 +367,7 @@ app.post("/jwt", (req, res) => {
     }
   );
 
-  // ✅ Cookie settings
+  // Cookie settings
   res.cookie('access_token', token, {
     httpOnly: true,
     secure: true,
@@ -1774,6 +1835,539 @@ app.get("/api/wishlist/:userId/count", verifyFirebaseToken, async (req, res) => 
     });
   }
 });
+
+
+// ============================================
+// Payment
+// CREATE CHECKOUT SESSION
+// ============================================
+
+app.post("/api/create-checkout-session", verifyFirebaseToken, async (req, res) => {
+  try {
+    const { items, userId, customerEmail } = req.body;
+
+    // Validation
+    if (!items || items.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Cart is empty"
+      });
+    }
+
+    if (!customerEmail) {
+      return res.status(400).json({
+        success: false,
+        message: "Customer email is required"
+      });
+    }
+
+    // Get user details
+    const user = await usersCollection.findOne({ 
+      email: customerEmail.toLowerCase() 
+    });
+
+    // Calculate totals
+    const subtotal = items.reduce((sum, item) => sum + (item.price * item.qty), 0);
+    const tax = subtotal * 0.05; // 5% tax
+    const shipping = subtotal > 1000 ? 0 : 100;
+    const total = subtotal + tax + shipping;
+
+    // Generate unique order ID
+    const orderId = `ORD-${Date.now()}-${Math.random().toString(36).substr(2, 9).toUpperCase()}`;
+
+    // Convert items to Stripe line items
+    const lineItems = items.map(item => ({
+      price_data: {
+        currency: 'bdt',
+        product_data: {
+          name: item.name,
+          description: `${item.size ? `Size: ${item.size}` : ''} ${item.color ? `Color: ${item.color}` : ''}`.trim(),
+          images: [item.image],
+          metadata: {
+            productId: item.productId,
+            size: item.size || 'N/A',
+            color: item.color || 'N/A'
+          }
+        },
+        unit_amount: Math.round(item.price * 100), // Convert to paisa
+      },
+      quantity: item.qty,
+    }));
+
+    // Add tax as a line item
+    if (tax > 0) {
+      lineItems.push({
+        price_data: {
+          currency: 'bdt',
+          product_data: {
+            name: 'Tax (5%)',
+            description: 'Sales tax'
+          },
+          unit_amount: Math.round(tax * 100),
+        },
+        quantity: 1,
+      });
+    }
+
+    // Add shipping as a line item
+    if (shipping > 0) {
+      lineItems.push({
+        price_data: {
+          currency: 'bdt',
+          product_data: {
+            name: 'Shipping Fee',
+            description: 'Standard shipping'
+          },
+          unit_amount: Math.round(shipping * 100),
+        },
+        quantity: 1,
+      });
+    }
+
+    // Create Stripe checkout session
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ['card'],
+      line_items: lineItems,
+      mode: 'payment',
+      customer_email: customerEmail,
+      client_reference_id: orderId,
+      metadata: {
+        orderId: orderId,
+        userId: userId,
+        customerEmail: customerEmail,
+        itemsCount: items.length.toString(),
+        subtotal: subtotal.toString(),
+        tax: tax.toString(),
+        shipping: shipping.toString(),
+        total: total.toString()
+      },
+      success_url: `${process.env.CLIENT_URL}/checkout/success?session_id={CHECKOUT_SESSION_ID}&order_id=${orderId}`,
+      cancel_url: `${process.env.CLIENT_URL}/checkout/cancel?session_id={CHECKOUT_SESSION_ID}`,
+      expires_at: Math.floor(Date.now() / 1000) + (30 * 60), // 30 minutes
+    });
+
+    // Create pending order in database
+    await ordersCollection.insertOne({
+      orderId: orderId,
+      userId: userId,
+      customer: {
+        email: customerEmail,
+        name: user?.displayName || 'Guest',
+        phone: user?.phoneNumber || '',
+        address: user?.address || {}
+      },
+      items: items,
+      pricing: {
+        subtotal: subtotal,
+        tax: tax,
+        shipping: shipping,
+        total: total
+      },
+      payment: {
+        method: 'stripe',
+        status: 'pending',
+        stripeSessionId: session.id,
+        stripePaymentIntentId: null,
+        transactionId: null
+      },
+      status: 'pending',
+      createdAt: new Date(),
+      updatedAt: new Date()
+    });
+
+    console.log('✅ Checkout session created:', session.id);
+    console.log('✅ Order created:', orderId);
+
+    res.json({
+      success: true,
+      sessionId: session.id,
+      url: session.url,
+      orderId: orderId
+    });
+
+  } catch (error) {
+    console.error('Checkout session error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to create checkout session',
+      error: error.message
+    });
+  }
+});
+
+// ============================================
+// HANDLE SUCCESSFUL PAYMENT (Webhook Handler)
+// ============================================
+
+async function handleSuccessfulPayment(session) {
+  try {
+    const orderId = session.client_reference_id;
+    const paymentIntentId = session.payment_intent;
+
+    console.log('Processing successful payment for order:', orderId);
+
+    // Get payment intent details
+    const paymentIntent = await stripe.paymentIntents.retrieve(paymentIntentId);
+
+    // Update order in database
+    const result = await ordersCollection.updateOne(
+      { orderId: orderId },
+      {
+        $set: {
+          'payment.status': 'paid',
+          'payment.stripePaymentIntentId': paymentIntentId,
+          'payment.transactionId': paymentIntent.id,
+          'payment.paidAt': new Date(),
+          'payment.amount': paymentIntent.amount / 100,
+          'payment.currency': paymentIntent.currency,
+          status: 'processing',
+          updatedAt: new Date()
+        }
+      }
+    );
+
+    if (result.modifiedCount > 0) {
+      console.log('✅ Order updated successfully:', orderId);
+
+      // Get the order details
+      const order = await ordersCollection.findOne({ orderId: orderId });
+
+      // Clear user's cart
+      if (order && order.userId) {
+        await cartsCollection.updateOne(
+          { userId: order.userId },
+          { 
+            $set: { 
+              items: [],
+              updatedAt: new Date()
+            } 
+          }
+        );
+        console.log('✅ Cart cleared for user:', order.userId);
+      }
+
+      // Update product stock (optional)
+      if (order && order.items) {
+        for (const item of order.items) {
+          await productsCollection.updateOne(
+            { _id: new ObjectId(item.productId) },
+            { 
+              $inc: { 
+                stock: -item.qty,
+                soldCount: item.qty 
+              },
+              $set: { updatedAt: new Date() }
+            }
+          );
+        }
+        console.log('✅ Product stocks updated');
+      }
+    } else {
+      console.error('❌ Order not found:', orderId);
+    }
+
+  } catch (error) {
+    console.error('Error handling successful payment:', error);
+  }
+}
+
+// ============================================
+// VERIFY PAYMENT STATUS
+// ============================================
+
+app.get("/api/checkout/verify/:sessionId", verifyFirebaseToken, async (req, res) => {
+  try {
+    const { sessionId } = req.params;
+
+    // Retrieve session from Stripe
+    const session = await stripe.checkout.sessions.retrieve(sessionId);
+
+    if (!session) {
+      return res.status(404).json({
+        success: false,
+        message: 'Session not found'
+      });
+    }
+
+    const orderId = session.client_reference_id;
+
+    // Get order from database
+    const order = await ordersCollection.findOne({ orderId: orderId });
+
+    if (!order) {
+      return res.status(404).json({
+        success: false,
+        message: 'Order not found'
+      });
+    }
+
+    res.json({
+      success: true,
+      paymentStatus: session.payment_status,
+      orderStatus: order.status,
+      order: order
+    });
+
+  } catch (error) {
+    console.error('Payment verification error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to verify payment',
+      error: error.message
+    });
+  }
+});
+
+// ============================================
+// GET ORDER DETAILS
+// ============================================
+
+app.get("/api/orders/:orderId", verifyFirebaseToken, async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    const userEmail = req.tokenEmail;
+
+    const order = await ordersCollection.findOne({ orderId: orderId });
+
+    if (!order) {
+      return res.status(404).json({
+        success: false,
+        message: 'Order not found'
+      });
+    }
+
+    // Check if user owns this order
+    if (order.customer.email.toLowerCase() !== userEmail.toLowerCase()) {
+      // Check if user is admin/staff
+      const user = await usersCollection.findOne({ 
+        email: userEmail.toLowerCase() 
+      });
+      
+      if (!user || (user.role !== 'admin' && user.role !== 'staff')) {
+        return res.status(403).json({
+          success: false,
+          message: 'Access denied'
+        });
+      }
+    }
+
+    res.json({
+      success: true,
+      order: order
+    });
+
+  } catch (error) {
+    console.error('Get order error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch order',
+      error: error.message
+    });
+  }
+});
+
+// ============================================
+// GET USER ORDERS
+// ============================================
+
+app.get("/api/users/:userId/orders", verifyFirebaseToken, async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { page = 1, limit = 10, status } = req.query;
+
+    // Verify user access
+    if (req.tokenEmail !== userId) {
+      return res.status(403).json({
+        success: false,
+        message: 'Access denied'
+      });
+    }
+
+    const query = {
+      $or: [
+        { userId: userId },
+        { 'customer.email': userId }
+      ]
+    };
+
+    if (status) {
+      query.status = status;
+    }
+
+    const orders = await ordersCollection
+      .find(query)
+      .sort({ createdAt: -1 })
+      .limit(limit * 1)
+      .skip((page - 1) * limit)
+      .toArray();
+
+    const count = await ordersCollection.countDocuments(query);
+
+    res.json({
+      success: true,
+      orders: orders,
+      totalPages: Math.ceil(count / limit),
+      currentPage: parseInt(page),
+      total: count
+    });
+
+  } catch (error) {
+    console.error('Get user orders error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch orders',
+      error: error.message
+    });
+  }
+});
+
+// ============================================
+// REFUND ORDER (Admin only)
+// ============================================
+
+app.post("/api/orders/:orderId/refund", verifyFirebaseToken, verifyAdmin, async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    const { reason } = req.body;
+
+    const order = await ordersCollection.findOne({ orderId: orderId });
+
+    if (!order) {
+      return res.status(404).json({
+        success: false,
+        message: 'Order not found'
+      });
+    }
+
+    if (order.payment.status !== 'paid') {
+      return res.status(400).json({
+        success: false,
+        message: 'Order is not paid yet'
+      });
+    }
+
+    if (!order.payment.stripePaymentIntentId) {
+      return res.status(400).json({
+        success: false,
+        message: 'No payment intent found'
+      });
+    }
+
+    // Create refund in Stripe
+    const refund = await stripe.refunds.create({
+      payment_intent: order.payment.stripePaymentIntentId,
+      reason: 'requested_by_customer',
+      metadata: {
+        orderId: orderId,
+        reason: reason || 'Customer request'
+      }
+    });
+
+    // Update order
+    await ordersCollection.updateOne(
+      { orderId: orderId },
+      {
+        $set: {
+          'payment.status': 'refunded',
+          'payment.refundId': refund.id,
+          'payment.refundedAt': new Date(),
+          'payment.refundReason': reason || 'Customer request',
+          status: 'refunded',
+          updatedAt: new Date()
+        }
+      }
+    );
+
+    // Restore product stock
+    if (order.items) {
+      for (const item of order.items) {
+        await productsCollection.updateOne(
+          { _id: new ObjectId(item.productId) },
+          { 
+            $inc: { 
+              stock: item.qty,
+              soldCount: -item.qty 
+            },
+            $set: { updatedAt: new Date() }
+          }
+        );
+      }
+    }
+
+    res.json({
+      success: true,
+      message: 'Order refunded successfully',
+      refund: refund
+    });
+
+  } catch (error) {
+    console.error('Refund error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to process refund',
+      error: error.message
+    });
+  }
+});
+
+// ============================================
+// UPDATE ORDER STATUS (Staff/Admin)
+// ============================================
+
+app.patch("/api/orders/:orderId/status", verifyFirebaseToken, verifyStaff, async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    const { status } = req.body;
+
+    const validStatuses = ['pending', 'processing', 'shipped', 'delivered', 'cancelled', 'refunded'];
+
+    if (!validStatuses.includes(status)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid status'
+      });
+    }
+
+    const result = await ordersCollection.updateOne(
+      { orderId: orderId },
+      {
+        $set: {
+          status: status,
+          updatedAt: new Date()
+        }
+      }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Order not found'
+      });
+    }
+
+    const updatedOrder = await ordersCollection.findOne({ orderId: orderId });
+
+    res.json({
+      success: true,
+      message: 'Order status updated',
+      order: updatedOrder
+    });
+
+  } catch (error) {
+    console.error('Update order status error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to update order status',
+      error: error.message
+    });
+  }
+});
+
+
+
+
+
+
     
   } catch (err) {
     console.error("MongoDB connection error:", err);
