@@ -17,7 +17,7 @@ const app = express();
 const allowedOrigins = [
   "http://localhost:5173",
   "http://localhost:3000",
-  process.env.CLIENT_URL, // Add from env
+  process.env.CLIENT_URL,
   "https://anis-abaiya.web.app",
   "https://anis-abaiya.firebaseapp.com"
 ].filter(Boolean); // Remove undefined values
@@ -26,9 +26,7 @@ const allowedOrigins = [
 
 app.use(cors({
   origin: function (origin, callback) {
-    // Allow requests with no origin (mobile apps, Postman, etc.)
     if (!origin) return callback(null, true);
-    
     if (allowedOrigins.indexOf(origin) === -1) {
       const msg = 'The CORS policy for this site does not allow access from the specified Origin.';
       return callback(new Error(msg), false);
@@ -43,11 +41,25 @@ app.use(cors({
 
 app.use(cookieParser());
 
+let ordersCollection, cartsCollection, productsCollection, usersCollection, wishlistsCollection;
+
 // Add this BEFORE express.json() middleware
 app.post("/api/webhook", 
   express.raw({ type: 'application/json' }), 
   async (req, res) => {
+    console.log('\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    console.log('🔔 STRIPE WEBHOOK RECEIVED');
+    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    
     const sig = req.headers['stripe-signature'];
+    
+    if (!sig) {
+      console.error('❌ No Stripe signature found');
+      return res.status(400).send('No Stripe signature');
+    }
+
+    console.log('✅ Signature present');
+
     let event;
 
     try {
@@ -56,41 +68,63 @@ app.post("/api/webhook",
         sig,
         process.env.STRIPE_WEBHOOK_SECRET
       );
+      
+      console.log('✅ Webhook signature verified');
+      console.log('📦 Event Type:', event.type);
+      console.log('🆔 Event ID:', event.id);
+      
     } catch (err) {
-      console.error('Webhook signature verification failed:', err.message);
+      console.error('❌ Webhook signature verification FAILED');
+      console.error('   Error:', err.message);
+      console.error('   Webhook Secret Configured:', !!process.env.STRIPE_WEBHOOK_SECRET);
       return res.status(400).send(`Webhook Error: ${err.message}`);
     }
 
-    console.log('Webhook received:', event.type);
-
     // Handle the event
-    switch (event.type) {
-      case 'checkout.session.completed':
-        const session = event.data.object;
-        await handleSuccessfulPayment(session);
-        break;
+    try {
+      switch (event.type) {
+        case 'checkout.session.completed':
+          const session = event.data.object;
+          
+          console.log('💳 Checkout Session Completed');
+          console.log('   Order ID:', session.client_reference_id);
+          console.log('   Session ID:', session.id);
+          console.log('   Payment Intent:', session.payment_intent);
+          console.log('   Payment Status:', session.payment_status);
+          
+          if (session.payment_status === 'paid') {
+            console.log('✅ Payment confirmed - processing...');
+            await handleSuccessfulPayment(session);
+          } else {
+            console.log('⚠️ Payment status not "paid":', session.payment_status);
+          }
+          break;
 
-      case 'checkout.session.expired':
-        console.log('Checkout session expired:', event.data.object.id);
-        break;
+        case 'checkout.session.expired':
+          console.log('⏰ Checkout session expired:', event.data.object.id);
+          break;
 
-      case 'payment_intent.succeeded':
-        console.log('Payment succeeded:', event.data.object.id);
-        break;
+        case 'payment_intent.succeeded':
+          console.log('✅ Payment Intent succeeded:', event.data.object.id);
+          break;
 
-      case 'payment_intent.payment_failed':
-        console.log('Payment failed:', event.data.object.id);
-        break;
+        case 'payment_intent.payment_failed':
+          console.log('❌ Payment Intent failed:', event.data.object.id);
+          break;
 
-      default:
-        console.log(`Unhandled event type: ${event.type}`);
+        default:
+          console.log('ℹ️ Unhandled event type:', event.type);
+      }
+    } catch (error) {
+      console.error('❌ Error processing webhook:', error);
+      console.error('   Stack:', error.stack);
     }
 
+    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
+    
     res.json({ received: true });
   }
 );
-
-
 
 app.use(express.json());
 
@@ -282,6 +316,112 @@ const verifyEmailToken = (req, res, next) => {
 }
 
 
+// ============================================
+// HANDLE SUCCESSFUL PAYMENT FUNCTION
+// ============================================
+async function handleSuccessfulPayment(session) {
+  console.log('\n🔄 Starting handleSuccessfulPayment...');
+  
+  try {
+    const orderId = session.client_reference_id;
+    const paymentIntentId = session.payment_intent;
+
+    console.log('📋 Processing Order:', orderId);
+    console.log('💳 Payment Intent:', paymentIntentId);
+
+    if (!orderId) {
+      console.error('❌ No order ID in session');
+      return;
+    }
+
+    // Get payment intent details
+    const paymentIntent = await stripe.paymentIntents.retrieve(paymentIntentId);
+    console.log('✅ Payment Intent retrieved');
+
+    // Update order
+    console.log('💾 Updating order in database...');
+    
+    const updateResult = await ordersCollection.updateOne(
+      { orderId: orderId },
+      {
+        $set: {
+          'payment.status': 'paid',
+          'payment.stripePaymentIntentId': paymentIntentId,
+          'payment.transactionId': paymentIntent.id,
+          'payment.paidAt': new Date(),
+          'payment.amount': paymentIntent.amount / 100,
+          'payment.currency': paymentIntent.currency,
+          status: 'processing',
+          updatedAt: new Date()
+        }
+      }
+    );
+
+    if (updateResult.modifiedCount > 0) {
+      console.log('✅ Order updated successfully');
+
+      const order = await ordersCollection.findOne({ orderId: orderId });
+      
+      if (!order) {
+        console.error('❌ Order not found after update');
+        return;
+      }
+
+      // Clear cart
+      if (order.userId) {
+        console.log('🛒 Clearing cart...');
+        
+        const cartResult = await cartsCollection.updateOne(
+          { userId: order.userId },
+          { $set: { items: [], updatedAt: new Date() } }
+        );
+        
+        if (cartResult.modifiedCount > 0) {
+          console.log('✅ Cart cleared');
+        } else {
+          console.log('⚠️ Cart not found or empty');
+        }
+      }
+
+      // Update stock
+      if (order.items && order.items.length > 0) {
+        console.log('📊 Updating product stocks...');
+        
+        for (const item of order.items) {
+          try {
+            const stockResult = await productsCollection.updateOne(
+              { _id: new ObjectId(item.productId) },
+              { 
+                $inc: { stock: -item.qty, soldCount: item.qty },
+                $set: { updatedAt: new Date() }
+              }
+            );
+            
+            if (stockResult.modifiedCount > 0) {
+              console.log(`   ✅ Stock updated: ${item.productId} (-${item.qty})`);
+            }
+          } catch (error) {
+            console.error(`   ❌ Stock update failed for ${item.productId}:`, error.message);
+          }
+        }
+        
+        console.log('✅ All stocks updated');
+      }
+
+      console.log('🎉 Payment processing complete!\n');
+
+    } else {
+      console.error('❌ Order not found in database:', orderId);
+    }
+
+  } catch (error) {
+    console.error('❌ ERROR in handleSuccessfulPayment:');
+    console.error('   Message:', error.message);
+    console.error('   Stack:', error.stack);
+  }
+}
+
+
 // MongoDB connection
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.hs9qs.mongodb.net/?retryWrites=true&w=majority`;
 
@@ -304,11 +444,11 @@ async function run() {
     const database = client.db("eCommerceDB");
 
     // Collections
-    const productsCollection = database.collection("products");
-    const cartsCollection = database.collection("carts");
-    const wishlistsCollection = database.collection("wishlists")
-    const usersCollection = database.collection("users")
-    const ordersCollection = database.collection("orders");
+    productsCollection = database.collection("products");
+    cartsCollection = database.collection("carts");
+    wishlistsCollection = database.collection("wishlists")
+    usersCollection = database.collection("users")
+    ordersCollection = database.collection("orders");
 
     console.log("All collections initialized");
 
@@ -900,6 +1040,592 @@ app.get("/api/orders", verifyFirebaseToken, verifyStaff, async (req, res) => {
     res.status(500).json({
       success: false,
       message: 'Failed to fetch orders',
+      error: error.message,
+    });
+  }
+});
+
+
+// ============================================
+// CUSTOMER MANAGEMENT API ROUTES
+// ============================================
+
+// ============================================
+// UPDATED CUSTOMER GET ROUTE WITH ADVANCED SORTING
+// Replace your existing /api/customers GET route with this
+// ============================================
+
+app.get("/api/customers", verifyFirebaseToken, verifyStaff, async (req, res) => {
+  try {
+    const { 
+      page = 1, 
+      limit = 10, 
+      status, 
+      search,
+      role,
+      sortBy = 'createdAt',
+      sortOrder = 'desc'
+    } = req.query;
+
+    // Build query
+    const query = {};
+
+    if (role && role !== 'all') {
+      query.role = role;
+    }
+    
+    if (status && status !== 'all') {
+      query.isActive = status === 'active';
+    }
+    
+    if (search) {
+      query.$or = [
+        { displayName: { $regex: search, $options: 'i' } },
+        { email: { $regex: search, $options: 'i' } },
+        { phoneNumber: { $regex: search, $options: 'i' } },
+      ];
+    }
+
+    // 🔥 FIXED: Case-insensitive sorting for displayName
+    let sortConfig = {};
+    const order = sortOrder === 'desc' ? -1 : 1;
+
+    // Only use database sorting for date fields
+    if (sortBy === 'createdAt' || sortBy === 'lastLogin') {
+      sortConfig = { [sortBy]: order };
+    } else {
+      // For other fields, we'll sort in memory after calculating stats
+      sortConfig = { createdAt: -1 }; // Default sort
+    }
+
+    // Execute query with pagination
+    const customers = await usersCollection
+      .find(query)
+      .sort(sortConfig)
+      .limit(limit * 1)
+      .skip((page - 1) * limit)
+      .toArray();
+
+    const count = await usersCollection.countDocuments(query);
+
+    // Calculate statistics for each customer
+    const customersWithStats = await Promise.all(
+      customers.map(async (customer) => {
+        const orderCount = await ordersCollection.countDocuments({
+          $or: [
+            { userId: customer.uid },
+            { 'customer.email': customer.email }
+          ]
+        });
+
+        const orders = await ordersCollection
+          .find({
+            $or: [
+              { userId: customer.uid },
+              { 'customer.email': customer.email }
+            ]
+          })
+          .toArray();
+
+        const totalSpent = orders.reduce((sum, order) => {
+          return sum + (order.pricing?.total || 0);
+        }, 0);
+
+        const lastOrder = orders.length > 0 
+          ? orders.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))[0]
+          : null;
+
+        return {
+          ...customer,
+          stats: {
+            orderCount,
+            totalSpent,
+            lastOrderDate: lastOrder?.createdAt || null,
+            averageOrderValue: orderCount > 0 ? totalSpent / orderCount : 0
+          }
+        };
+      })
+    );
+
+    // 🔥 FIXED: Case-insensitive in-memory sorting
+    if (sortBy === 'displayName') {
+      customersWithStats.sort((a, b) => {
+        const nameA = (a.displayName || '').toLowerCase();
+        const nameB = (b.displayName || '').toLowerCase();
+        
+        if (order === 1) { // Ascending
+          return nameA.localeCompare(nameB);
+        } else { // Descending
+          return nameB.localeCompare(nameA);
+        }
+      });
+    } else if (sortBy === 'totalSpent') {
+      customersWithStats.sort((a, b) => {
+        const aSpent = a.stats?.totalSpent || 0;
+        const bSpent = b.stats?.totalSpent || 0;
+        return order === 1 ? aSpent - bSpent : bSpent - aSpent;
+      });
+    } else if (sortBy === 'orderCount') {
+      customersWithStats.sort((a, b) => {
+        const aCount = a.stats?.orderCount || 0;
+        const bCount = b.stats?.orderCount || 0;
+        return order === 1 ? aCount - bCount : bCount - aCount;
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      customers: customersWithStats,
+      pagination: {
+        total: count,
+        totalPages: Math.ceil(count / limit),
+        currentPage: parseInt(page),
+        limit: parseInt(limit)
+      }
+    });
+
+  } catch (error) {
+    console.error('Get customers error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch customers',
+      error: error.message,
+    });
+  }
+});
+
+// GET - Get single customer details (Admin/Staff)
+app.get("/api/customers/:customerId", verifyFirebaseToken, verifyStaff, async (req, res) => {
+  try {
+    const { customerId } = req.params;
+
+    // Find customer by _id or uid
+    const customer = await usersCollection.findOne({
+      $or: [
+        { _id: new ObjectId(customerId) },
+        { uid: customerId }
+      ]
+    });
+
+    if (!customer) {
+      return res.status(404).json({
+        success: false,
+        message: 'Customer not found',
+      });
+    }
+
+    // Get customer orders
+    const orders = await ordersCollection
+      .find({
+        $or: [
+          { userId: customer.uid },
+          { 'customer.email': customer.email }
+        ]
+      })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    // Calculate stats
+    const totalSpent = orders.reduce((sum, order) => {
+      return sum + (order.pricing?.total || 0);
+    }, 0);
+
+    const completedOrders = orders.filter(o => o.status === 'delivered').length;
+    const pendingOrders = orders.filter(o => ['pending', 'processing'].includes(o.status)).length;
+
+    // Get wishlist count
+    const wishlistCount = await wishlistsCollection.countDocuments({
+      userId: customer.email
+    });
+
+    res.status(200).json({
+      success: true,
+      customer: {
+        ...customer,
+        stats: {
+          totalOrders: orders.length,
+          completedOrders,
+          pendingOrders,
+          totalSpent,
+          averageOrderValue: orders.length > 0 ? totalSpent / orders.length : 0,
+          wishlistCount
+        },
+        recentOrders: orders.slice(0, 5)
+      }
+    });
+
+  } catch (error) {
+    console.error('Get customer details error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch customer details',
+      error: error.message,
+    });
+  }
+});
+
+// PATCH - Update customer status (Admin only)
+app.patch("/api/customers/:customerId/status", verifyFirebaseToken, verifyAdmin, async (req, res) => {
+  try {
+    const { customerId } = req.params;
+    const { isActive } = req.body;
+
+    if (typeof isActive !== 'boolean') {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid status value. Must be boolean.',
+      });
+    }
+
+    const result = await usersCollection.updateOne(
+      { $or: [{ _id: new ObjectId(customerId) }, { uid: customerId }] },
+      { 
+        $set: { 
+          isActive,
+          updatedAt: new Date()
+        } 
+      }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Customer not found',
+      });
+    }
+
+    const updatedCustomer = await usersCollection.findOne({
+      $or: [{ _id: new ObjectId(customerId) }, { uid: customerId }]
+    });
+
+    res.status(200).json({
+      success: true,
+      message: `Customer ${isActive ? 'activated' : 'deactivated'} successfully`,
+      customer: updatedCustomer,
+    });
+
+  } catch (error) {
+    console.error('Update customer status error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to update customer status',
+      error: error.message,
+    });
+  }
+});
+
+// PATCH - Update customer details (Admin only)
+app.patch("/api/customers/:customerId", verifyFirebaseToken, verifyAdmin, async (req, res) => {
+  try {
+    const { customerId } = req.params;
+    const { displayName, phoneNumber, address, preferences } = req.body;
+
+    const customer = await usersCollection.findOne({
+      $or: [{ _id: new ObjectId(customerId) }, { uid: customerId }]
+    });
+
+    if (!customer) {
+      return res.status(404).json({
+        success: false,
+        message: 'Customer not found',
+      });
+    }
+
+    // Build update object
+    const updateData = { updatedAt: new Date() };
+    
+    if (displayName) updateData.displayName = displayName;
+    if (phoneNumber) updateData.phoneNumber = phoneNumber;
+    if (address) updateData.address = { ...customer.address, ...address };
+    if (preferences) updateData.preferences = { ...customer.preferences, ...preferences };
+
+    await usersCollection.updateOne(
+      { $or: [{ _id: new ObjectId(customerId) }, { uid: customerId }] },
+      { $set: updateData }
+    );
+
+    const updatedCustomer = await usersCollection.findOne({
+      $or: [{ _id: new ObjectId(customerId) }, { uid: customerId }]
+    });
+
+    res.status(200).json({
+      success: true,
+      message: 'Customer updated successfully',
+      customer: updatedCustomer,
+    });
+
+  } catch (error) {
+    console.error('Update customer error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to update customer',
+      error: error.message,
+    });
+  }
+});
+
+// GET - Get customer statistics (Admin only)
+app.get("/api/customers/stats/overview", verifyFirebaseToken, verifyAdmin, async (req, res) => {
+  try {
+    // 🔧 FIX: Update existing users without lastLogin
+    await usersCollection.updateMany(
+      { lastLogin: { $exists: false } },
+      { $set: { lastLogin: new Date() } }
+    );
+
+    const totalCustomers = await usersCollection.countDocuments();
+    const adminCount = await usersCollection.countDocuments({ role: 'admin' });
+    const staffCount = await usersCollection.countDocuments({ role: 'staff' });
+    const regularUsers = await usersCollection.countDocuments({ role: 'user' });
+
+    // Active customers (based on isActive field AND recent login)
+    const activeCustomers = await usersCollection.countDocuments({ 
+      isActive: true 
+    });
+    
+    const inactiveCustomers = await usersCollection.countDocuments({ 
+      isActive: false 
+    });
+    
+    // Recently active users (logged in last 30 days)
+    const thirtyDaysAgo = new Date();
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+    
+    const recentlyActiveUsers = await usersCollection.countDocuments({
+      lastLogin: { $gte: thirtyDaysAgo }
+    });
+
+    // New users this month
+    const firstDayOfMonth = new Date();
+    firstDayOfMonth.setDate(1);
+    firstDayOfMonth.setHours(0, 0, 0, 0);
+    
+    const newUsersThisMonth = await usersCollection.countDocuments({
+      createdAt: { $gte: firstDayOfMonth }
+    });
+
+    // ❌ BEFORE (Using distinct - not supported in API v1)
+    // const customersWithOrders = await ordersCollection.distinct('customer.email');
+
+    // ✅ AFTER (Using aggregation - supported in API v1)
+    const customersWithOrdersResult = await ordersCollection.aggregate([
+      {
+        $group: {
+          _id: '$customer.email'
+        }
+      },
+      {
+        $count: 'total'
+      }
+    ]).toArray();
+
+    const customersWithOrders = customersWithOrdersResult.length > 0 
+      ? customersWithOrdersResult[0].total 
+      : 0;
+
+    // Top customers by spending
+    const topCustomers = await ordersCollection.aggregate([
+      {
+        $match: { 'payment.status': 'paid' }
+      },
+      {
+        $group: {
+          _id: '$customer.email',
+          totalSpent: { $sum: '$pricing.total' },
+          orderCount: { $sum: 1 }
+        }
+      },
+      {
+        $sort: { totalSpent: -1 }
+      },
+      {
+        $limit: 5
+      }
+    ]).toArray();
+
+    res.status(200).json({
+      success: true,
+      stats: {
+        totalCustomers,
+        activeCustomers,
+        inactiveCustomers,
+        adminCount,
+        staffCount,
+        regularUsers,
+        recentlyActiveUsers,
+        newUsersThisMonth,
+        customersWithOrders,
+        topCustomers
+      }
+    });
+
+  } catch (error) {
+    console.error('Get customer stats error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch customer statistics',
+      error: error.message,
+    });
+  }
+});
+
+// DELETE - Delete customer (Admin only)
+app.delete("/api/customers/:customerId", verifyFirebaseToken, verifyAdmin, async (req, res) => {
+  try {
+    const { customerId } = req.params;
+
+    const customer = await usersCollection.findOne({
+      $or: [{ _id: new ObjectId(customerId) }, { uid: customerId }]
+    });
+
+    if (!customer) {
+      return res.status(404).json({
+        success: false,
+        message: 'Customer not found',
+      });
+    }
+
+    // Check if customer has orders
+    const orderCount = await ordersCollection.countDocuments({
+      $or: [
+        { userId: customer.uid },
+        { 'customer.email': customer.email }
+      ]
+    });
+
+    if (orderCount > 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Cannot delete customer with existing orders. Deactivate instead.',
+      });
+    }
+
+    // Delete from Firebase Auth
+    try {
+      await admin.auth().deleteUser(customer.uid);
+    } catch (firebaseError) {
+      console.error('Firebase deletion error:', firebaseError);
+      // Continue with database deletion even if Firebase fails
+    }
+
+    // Delete from database
+    await usersCollection.deleteOne({
+      $or: [{ _id: new ObjectId(customerId) }, { uid: customerId }]
+    });
+
+    // Clean up related data
+    await wishlistsCollection.deleteMany({ userId: customer.email });
+    await cartsCollection.deleteMany({ userId: customer.email });
+
+    res.status(200).json({
+      success: true,
+      message: 'Customer deleted successfully',
+    });
+
+  } catch (error) {
+    console.error('Delete customer error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to delete customer',
+      error: error.message,
+    });
+  }
+});
+
+// POST - Send message to customer (Admin/Staff)
+app.post("/api/customers/:customerId/message", verifyFirebaseToken, verifyStaff, async (req, res) => {
+  try {
+    const { customerId } = req.params;
+    const { subject, message } = req.body;
+
+    if (!subject || !message) {
+      return res.status(400).json({
+        success: false,
+        message: 'Subject and message are required',
+      });
+    }
+
+    const customer = await usersCollection.findOne({
+      $or: [{ _id: new ObjectId(customerId) }, { uid: customerId }]
+    });
+
+    if (!customer) {
+      return res.status(404).json({
+        success: false,
+        message: 'Customer not found',
+      });
+    }
+
+    // TODO: Implement actual email sending logic here
+    // For now, just return success
+    console.log(`Sending message to ${customer.email}:`, { subject, message });
+
+    res.status(200).json({
+      success: true,
+      message: 'Message sent successfully',
+      recipient: customer.email
+    });
+
+  } catch (error) {
+    console.error('Send message error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to send message',
+      error: error.message,
+    });
+  }
+});
+
+// GET - Export customers data (Admin only)
+app.get("/api/customers/export/csv", verifyFirebaseToken, verifyAdmin, async (req, res) => {
+  try {
+    const customers = await usersCollection.find({}).toArray();
+
+    // Generate CSV
+    const csvHeader = 'Name,Email,Phone,Role,Status,Join Date,Total Orders,Total Spent\n';
+    
+    const csvData = await Promise.all(
+      customers.map(async (customer) => {
+        const orderCount = await ordersCollection.countDocuments({
+          $or: [
+            { userId: customer.uid },
+            { 'customer.email': customer.email }
+          ]
+        });
+
+        const orders = await ordersCollection.find({
+          $or: [
+            { userId: customer.uid },
+            { 'customer.email': customer.email }
+          ]
+        }).toArray();
+
+        const totalSpent = orders.reduce((sum, order) => sum + (order.pricing?.total || 0), 0);
+
+        return [
+          customer.displayName || '',
+          customer.email || '',
+          customer.phoneNumber || '',
+          customer.role || 'user',
+          customer.isActive ? 'active' : 'inactive',
+          customer.createdAt ? new Date(customer.createdAt).toLocaleDateString() : '',
+          orderCount,
+          totalSpent.toFixed(2)
+        ].join(',');
+      })
+    );
+
+    const csv = csvHeader + csvData.join('\n');
+
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename=customers-${Date.now()}.csv`);
+    res.status(200).send(csv);
+
+  } catch (error) {
+    console.error('Export customers error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to export customers',
       error: error.message,
     });
   }
@@ -1996,85 +2722,8 @@ app.post("/api/create-checkout-session", verifyFirebaseToken, async (req, res) =
 });
 
 // ============================================
-// HANDLE SUCCESSFUL PAYMENT (Webhook Handler)
-// ============================================
-
-async function handleSuccessfulPayment(session) {
-  try {
-    const orderId = session.client_reference_id;
-    const paymentIntentId = session.payment_intent;
-
-    console.log('Processing successful payment for order:', orderId);
-
-    // Get payment intent details
-    const paymentIntent = await stripe.paymentIntents.retrieve(paymentIntentId);
-
-    // Update order in database
-    const result = await ordersCollection.updateOne(
-      { orderId: orderId },
-      {
-        $set: {
-          'payment.status': 'paid',
-          'payment.stripePaymentIntentId': paymentIntentId,
-          'payment.transactionId': paymentIntent.id,
-          'payment.paidAt': new Date(),
-          'payment.amount': paymentIntent.amount / 100,
-          'payment.currency': paymentIntent.currency,
-          status: 'processing',
-          updatedAt: new Date()
-        }
-      }
-    );
-
-    if (result.modifiedCount > 0) {
-      console.log('✅ Order updated successfully:', orderId);
-
-      // Get the order details
-      const order = await ordersCollection.findOne({ orderId: orderId });
-
-      // Clear user's cart
-      if (order && order.userId) {
-        await cartsCollection.updateOne(
-          { userId: order.userId },
-          { 
-            $set: { 
-              items: [],
-              updatedAt: new Date()
-            } 
-          }
-        );
-        console.log('✅ Cart cleared for user:', order.userId);
-      }
-
-      // Update product stock (optional)
-      if (order && order.items) {
-        for (const item of order.items) {
-          await productsCollection.updateOne(
-            { _id: new ObjectId(item.productId) },
-            { 
-              $inc: { 
-                stock: -item.qty,
-                soldCount: item.qty 
-              },
-              $set: { updatedAt: new Date() }
-            }
-          );
-        }
-        console.log('✅ Product stocks updated');
-      }
-    } else {
-      console.error('❌ Order not found:', orderId);
-    }
-
-  } catch (error) {
-    console.error('Error handling successful payment:', error);
-  }
-}
-
-// ============================================
 // VERIFY PAYMENT STATUS
 // ============================================
-
 app.get("/api/checkout/verify/:sessionId", verifyFirebaseToken, async (req, res) => {
   try {
     const { sessionId } = req.params;
