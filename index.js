@@ -1147,7 +1147,7 @@ app.get("/api/customers", verifyFirebaseToken, verifyStaff, async (req, res) => 
       })
     );
 
-    // 🔥 FIXED: Case-insensitive in-memory sorting
+    //Case-insensitive in-memory sorting
     if (sortBy === 'displayName') {
       customersWithStats.sort((a, b) => {
         const nameA = (a.displayName || '').toLowerCase();
@@ -3012,10 +3012,85 @@ app.patch("/api/orders/:orderId/status", verifyFirebaseToken, verifyStaff, async
   }
 });
 
+// GET - Order Statistics (Admin)
+app.get("/api/orders/stats/overview", verifyFirebaseToken, verifyAdmin, async (req, res) => {
+  try {
+    const totalOrders = await ordersCollection.countDocuments();
+    const pendingOrders = await ordersCollection.countDocuments({ status: 'pending' });
+    const processingOrders = await ordersCollection.countDocuments({ status: 'processing' });
+    const shippedOrders = await ordersCollection.countDocuments({ status: 'shipped' });
+    const deliveredOrders = await ordersCollection.countDocuments({ status: 'delivered' });
+    
+    const totalRevenue = await ordersCollection.aggregate([
+      { $match: { 'payment.status': 'paid' } },
+      { $group: { _id: null, total: { $sum: '$pricing.total' } } }
+    ]).toArray();
 
+    res.json({
+      success: true,
+      stats: {
+        totalOrders,
+        pendingOrders,
+        processingOrders,
+        shippedOrders,
+        deliveredOrders,
+        totalRevenue: totalRevenue[0]?.total || 0
+      }
+    });
+  } catch (error) {
+    console.error('Get order stats error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch order statistics',
+      error: error.message,
+    });
+  }
+});
 
+// GET - Export Orders CSV (Admin)
+app.get("/api/orders/export/csv", verifyFirebaseToken, verifyAdmin, async (req, res) => {
+  try {
+    const { status, payment, search } = req.query;
+    
+    const query = {};
+    if (status) query.status = status;
+    if (payment) query['payment.status'] = payment;
+    if (search) {
+      query.$or = [
+        { orderId: { $regex: search, $options: 'i' } },
+        { 'customer.email': { $regex: search, $options: 'i' } }
+      ];
+    }
 
+    const orders = await ordersCollection.find(query).toArray();
 
+    // CSV generation
+    const csvHeader = 'Order ID,Customer Name,Email,Items,Total,Status,Payment,Date\n';
+    const csvData = orders.map(order => [
+      order.orderId,
+      order.customer?.name || '',
+      order.customer?.email || '',
+      order.items?.length || 0,
+      order.pricing?.total?.toFixed(2) || '0.00',
+      order.status,
+      order.payment?.status || '',
+      new Date(order.createdAt).toLocaleDateString()
+    ].join(',')).join('\n');
+
+    const csv = csvHeader + csvData;
+
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename=orders-${Date.now()}.csv`);
+    res.status(200).send(csv);
+  } catch (error) {
+    console.error('Export orders error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to export orders',
+      error: error.message,
+    });
+  }
+});
 
     
   } catch (err) {
