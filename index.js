@@ -41,7 +41,7 @@ app.use(cors({
 
 app.use(cookieParser());
 
-let ordersCollection, cartsCollection, productsCollection, usersCollection, wishlistsCollection;
+let ordersCollection, cartsCollection, productsCollection, usersCollection, wishlistsCollection, couponsCollection;;
 
 // Add this BEFORE express.json() middleware
 app.post("/api/webhook", 
@@ -125,6 +125,8 @@ app.post("/api/webhook",
     res.json({ received: true });
   }
 );
+
+
 
 app.use(express.json());
 
@@ -315,6 +317,163 @@ const verifyEmailToken = (req, res, next) => {
         next()
 }
 
+// ============================================
+// ADD THESE TEST ROUTES TO YOUR index.js
+// Place them after your middleware setup
+// ============================================
+
+// 🧪 TEST ROUTE 1: Check if token is received
+app.get("/api/test/token", async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization;
+    
+    console.log('\n🧪 TOKEN TEST ROUTE HIT');
+    console.log('Authorization Header:', authHeader);
+    console.log('Headers:', JSON.stringify(req.headers, null, 2));
+    
+    if (!authHeader) {
+      return res.status(401).json({
+        success: false,
+        message: 'No authorization header found',
+        headers: req.headers
+      });
+    }
+    
+    if (!authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({
+        success: false,
+        message: 'Invalid authorization format. Expected: Bearer <token>',
+        received: authHeader.substring(0, 50) + '...'
+      });
+    }
+    
+    const token = authHeader.split(' ')[1];
+    
+    res.json({
+      success: true,
+      message: 'Token received successfully!',
+      tokenLength: token.length,
+      tokenPreview: token.substring(0, 50) + '...'
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Test route error',
+      error: error.message
+    });
+  }
+});
+
+// 🧪 TEST ROUTE 2: Check Firebase token verification
+app.get("/api/test/verify-token", verifyFirebaseToken, async (req, res) => {
+  try {
+    console.log('\n🧪 TOKEN VERIFICATION TEST');
+    console.log('Token verified successfully!');
+    console.log('User UID:', req.uid);
+    console.log('User Email:', req.tokenEmail);
+    
+    res.json({
+      success: true,
+      message: 'Token verified successfully!',
+      user: {
+        uid: req.uid,
+        email: req.tokenEmail,
+        emailVerified: req.emailVerified
+      }
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Verification test error',
+      error: error.message
+    });
+  }
+});
+
+// 🧪 TEST ROUTE 3: Check admin access
+app.get("/api/test/admin", verifyFirebaseToken, verifyAdmin, async (req, res) => {
+  try {
+    console.log('\n🧪 ADMIN ACCESS TEST');
+    console.log('Admin verified!');
+    console.log('Admin user:', req.user);
+    
+    res.json({
+      success: true,
+      message: 'Admin access verified!',
+      user: req.user
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Admin test error',
+      error: error.message
+    });
+  }
+});
+
+// 🧪 TEST ROUTE 4: Simple product test (no auth)
+app.get("/api/test/products", async (req, res) => {
+  try {
+    const count = await productsCollection.countDocuments();
+    const sample = await productsCollection.findOne();
+    
+    res.json({
+      success: true,
+      message: 'Database connection OK',
+      totalProducts: count,
+      sampleProduct: sample ? {
+        id: sample._id,
+        name: sample.productName,
+        sku: sample.sku
+      } : null
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Database test error',
+      error: error.message
+    });
+  }
+});
+
+// 🧪 TEST ROUTE 5: Test product delete (with auth)
+app.delete("/api/test/products/:id", verifyFirebaseToken, verifyAdmin, async (req, res) => {
+  try {
+    const id = req.params.id;
+    
+    console.log('\n🧪 DELETE TEST');
+    console.log('Product ID:', id);
+    console.log('User:', req.tokenEmail);
+    console.log('Admin:', req.user.role);
+    
+    // Don't actually delete, just check if we can
+    const product = await productsCollection.findOne({ _id: new ObjectId(id) });
+    
+    if (!product) {
+      return res.status(404).json({
+        success: false,
+        message: 'Product not found'
+      });
+    }
+    
+    res.json({
+      success: true,
+      message: 'Delete would work! (Not actually deleted in test)',
+      product: {
+        id: product._id,
+        name: product.productName
+      }
+    });
+  } catch (error) {
+    console.error('Delete test error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Delete test error',
+      error: error.message
+    });
+  }
+});
+
 
 // ============================================
 // HANDLE SUCCESSFUL PAYMENT FUNCTION
@@ -449,6 +608,7 @@ async function run() {
     wishlistsCollection = database.collection("wishlists")
     usersCollection = database.collection("users")
     ordersCollection = database.collection("orders");
+    couponsCollection = database.collection("coupons");
 
     console.log("All collections initialized");
 
@@ -1763,76 +1923,187 @@ app.post("/api/products", async (req, res) => {
 });
 
 
-    // PUT - Update product
-    app.put("/api/products/:id", async (req, res) => {
-      try {
-        const id = req.params.id;
-        const updateData = req.body;
+// ============================================
+// PUT - Update product - FIXED VERSION
+// ============================================
+app.put("/api/products/:id", verifyFirebaseToken, verifyAdmin, async (req, res) => {
+  try {
+    const id = req.params.id;
+    const updateData = req.body;
 
-        delete updateData._id;
-        updateData.updatedAt = new Date();
+    console.log('📝 Updating product:', id);
+    console.log('📦 Update data:', JSON.stringify(updateData, null, 2));
 
-        const result = await productsCollection.updateOne(
-          { _id: new ObjectId(id) },
-          { $set: updateData }
-        );
+    // Remove _id if present
+    delete updateData._id;
+    
+    // Add updated timestamp
+    updateData.updatedAt = new Date();
 
-        if (result.matchedCount === 0) {
-          return res.status(404).json({ 
-            success: false,
-            message: "Product not found" 
-          });
-        }
+    // Update in database
+    const result = await productsCollection.updateOne(
+      { _id: new ObjectId(id) },
+      { $set: updateData }
+    );
 
-        const updatedProduct = await productsCollection.findOne({ 
-          _id: new ObjectId(id) 
-        });
+    if (result.matchedCount === 0) {
+      console.log('❌ Product not found');
+      return res.status(404).json({ 
+        success: false,
+        message: "Product not found" 
+      });
+    }
 
-        res.json({
-          success: true,
-          message: "Product updated successfully",
-          product: updatedProduct
-        });
+    console.log('✅ Product updated in database');
 
-      } catch (err) {
-        res.status(500).json({ 
-          success: false,
-          message: "Error updating product", 
-          error: err.message 
-        });
-      }
+    // Fetch updated product
+    const updatedProduct = await productsCollection.findOne({ 
+      _id: new ObjectId(id) 
     });
 
-
-    // DELETE - Delete product
-    app.delete("/api/products/:id", async (req, res) => {
-      try {
-        const id = req.params.id;
-
-        const result = await productsCollection.deleteOne({ 
-          _id: new ObjectId(id) 
-        });
-
-        if (result.deletedCount === 0) {
-          return res.status(404).json({ 
-            success: false,
-            message: "Product not found" 
-          });
-        }
-
-        res.json({
-          success: true,
-          message: "Product deleted successfully"
-        });
-
-      } catch (err) {
-        res.status(500).json({ 
-          success: false,
-          message: "Error deleting product", 
-          error: err.message 
-        });
-      }
+    res.json({
+      success: true,
+      message: "Product updated successfully",
+      product: updatedProduct
     });
+
+  } catch (err) {
+    console.error('❌ Update product error:', err);
+    res.status(500).json({ 
+      success: false,
+      message: "Error updating product", 
+      error: err.message 
+    });
+  }
+});
+
+
+// DELETE - Delete product with Cloudinary cleanup
+app.delete("/api/products/:id", verifyFirebaseToken, verifyAdmin, async (req, res) => {
+  try {
+    const id = req.params.id;
+
+    console.log('🗑️ DELETE request for product:', id);
+
+    // 1. First, get the product to access media publicIds
+    const product = await productsCollection.findOne({ 
+      _id: new ObjectId(id) 
+    });
+
+    if (!product) {
+      console.log('❌ Product not found');
+      return res.status(404).json({ 
+        success: false,
+        message: "Product not found" 
+      });
+    }
+
+    console.log('✅ Product found:', product.productName);
+
+    // 2. Collect all Cloudinary publicIds to delete
+    const publicIdsToDelete = [];
+    
+    // Images
+    if (product.media?.images && Array.isArray(product.media.images)) {
+      product.media.images.forEach(img => {
+        if (img.publicId) {
+          publicIdsToDelete.push(img.publicId);
+        }
+      });
+    } else if (product.images && Array.isArray(product.images)) {
+      product.images.forEach(img => {
+        if (img.publicId) {
+          publicIdsToDelete.push(img.publicId);
+        }
+      });
+    }
+
+    console.log('📸 Found', publicIdsToDelete.length, 'images to delete');
+
+    // Video
+    let videoPublicId = null;
+    if (product.media?.video?.publicId) {
+      videoPublicId = product.media.video.publicId;
+      console.log('🎬 Found video to delete:', videoPublicId);
+    } else if (product.video?.publicId) {
+      videoPublicId = product.video.publicId;
+      console.log('🎬 Found video to delete:', videoPublicId);
+    }
+
+    // 3. Delete from MongoDB first
+    console.log('💾 Deleting from database...');
+    const deleteResult = await productsCollection.deleteOne({ 
+      _id: new ObjectId(id) 
+    });
+
+    if (deleteResult.deletedCount === 0) {
+      console.log('❌ Failed to delete from database');
+      return res.status(500).json({ 
+        success: false,
+        message: "Failed to delete product from database" 
+      });
+    }
+
+    console.log('✅ Product deleted from database');
+
+    // 4. Delete images from Cloudinary (in background)
+    if (publicIdsToDelete.length > 0) {
+      console.log('🧹 Starting Cloudinary cleanup for images...');
+      
+      // Don't await this - let it run in background
+      Promise.all(
+        publicIdsToDelete.map(async (publicId) => {
+          try {
+            const result = await cloudinary.uploader.destroy(publicId, {
+              invalidate: true,
+              resource_type: 'image'
+            });
+            console.log('✅ Deleted image:', publicId, result.result);
+            return result;
+          } catch (error) {
+            console.error('❌ Failed to delete image:', publicId, error.message);
+            return { error: error.message };
+          }
+        })
+      ).then(results => {
+        const successful = results.filter(r => r.result === 'ok' || r.result === 'not found').length;
+        console.log(`✅ Cloudinary cleanup complete: ${successful}/${publicIdsToDelete.length} images deleted`);
+      }).catch(error => {
+        console.error('❌ Cloudinary batch delete error:', error);
+      });
+    }
+
+    // 5. Delete video from Cloudinary (in background)
+    if (videoPublicId) {
+      console.log('🧹 Starting Cloudinary cleanup for video...');
+      
+      cloudinary.uploader.destroy(videoPublicId, {
+        invalidate: true,
+        resource_type: 'video'
+      }).then(result => {
+        console.log('✅ Deleted video:', videoPublicId, result.result);
+      }).catch(error => {
+        console.error('❌ Failed to delete video:', videoPublicId, error.message);
+      });
+    }
+
+    // 6. Return success immediately (don't wait for Cloudinary)
+    res.json({
+      success: true,
+      message: "Product deleted successfully",
+      deletedId: id,
+      mediaCleanupStarted: publicIdsToDelete.length + (videoPublicId ? 1 : 0)
+    });
+
+  } catch (err) {
+    console.error('❌ Delete product error:', err);
+    res.status(500).json({ 
+      success: false,
+      message: "Error deleting product", 
+      error: err.message 
+    });
+  }
+});
 
 
     // PATCH - Update product status
@@ -2568,9 +2839,19 @@ app.get("/api/wishlist/:userId/count", verifyFirebaseToken, async (req, res) => 
 // CREATE CHECKOUT SESSION
 // ============================================
 
+// ============================================
+// CREATE CHECKOUT SESSION WITH COUPON SUPPORT
+// Replace your existing /api/create-checkout-session route
+// ============================================
+
 app.post("/api/create-checkout-session", verifyFirebaseToken, async (req, res) => {
   try {
-    const { items, userId, customerEmail } = req.body;
+    const { items, userId, customerEmail, coupon } = req.body;
+
+    console.log('💳 Creating checkout session...');
+    console.log('   Customer:', customerEmail);
+    console.log('   Items:', items.length);
+    console.log('   Coupon:', coupon ? coupon.code : 'None');
 
     // Validation
     if (!items || items.length === 0) {
@@ -2594,9 +2875,31 @@ app.post("/api/create-checkout-session", verifyFirebaseToken, async (req, res) =
 
     // Calculate totals
     const subtotal = items.reduce((sum, item) => sum + (item.price * item.qty), 0);
-    const tax = subtotal * 0.05; // 5% tax
-    const shipping = subtotal > 1000 ? 0 : 100;
-    const total = subtotal + tax + shipping;
+    
+    // ✅ Apply discount if coupon exists
+    let discount = 0;
+    if (coupon) {
+      if (coupon.type === 'percentage') {
+        discount = coupon.discount || 0;
+      } else if (coupon.type === 'fixed') {
+        discount = coupon.discount || coupon.value || 0;
+        if (discount > subtotal) discount = subtotal;
+      }
+    }
+
+    const tax = (subtotal - discount) * 0.05; // 5% tax on discounted amount
+    
+    // ✅ Free shipping if coupon type is free_shipping OR order > 1000
+    const shipping = coupon?.type === 'free_shipping' || subtotal > 1000 ? 0 : 100;
+    
+    const total = subtotal - discount + tax + shipping;
+
+    console.log('💰 Pricing breakdown:');
+    console.log('   Subtotal:', subtotal);
+    console.log('   Discount:', discount);
+    console.log('   Tax:', tax);
+    console.log('   Shipping:', shipping);
+    console.log('   Total:', total);
 
     // Generate unique order ID
     const orderId = `ORD-${Date.now()}-${Math.random().toString(36).substr(2, 9).toUpperCase()}`;
@@ -2619,6 +2922,23 @@ app.post("/api/create-checkout-session", verifyFirebaseToken, async (req, res) =
       },
       quantity: item.qty,
     }));
+
+    // ✅ Add discount as negative line item if coupon applied
+    if (discount > 0) {
+      lineItems.push({
+        price_data: {
+          currency: 'bdt',
+          product_data: {
+            name: `Discount (${coupon.code})`,
+            description: coupon.type === 'percentage' 
+              ? `${coupon.value}% OFF` 
+              : `$${coupon.value} OFF`
+          },
+          unit_amount: -Math.round(discount * 100), // Negative amount for discount
+        },
+        quantity: 1,
+      });
+    }
 
     // Add tax as a line item
     if (tax > 0) {
@@ -2651,29 +2971,39 @@ app.post("/api/create-checkout-session", verifyFirebaseToken, async (req, res) =
     }
 
     // Create Stripe checkout session
+    const sessionMetadata = {
+      orderId: orderId,
+      userId: userId,
+      customerEmail: customerEmail,
+      itemsCount: items.length.toString(),
+      subtotal: subtotal.toString(),
+      discount: discount.toString(),
+      tax: tax.toString(),
+      shipping: shipping.toString(),
+      total: total.toString()
+    };
+
+    // ✅ Add coupon info to metadata if applied
+    if (coupon) {
+      sessionMetadata.couponCode = coupon.code;
+      sessionMetadata.couponType = coupon.type;
+      sessionMetadata.couponDiscount = discount.toString();
+    }
+
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ['card'],
       line_items: lineItems,
       mode: 'payment',
       customer_email: customerEmail,
       client_reference_id: orderId,
-      metadata: {
-        orderId: orderId,
-        userId: userId,
-        customerEmail: customerEmail,
-        itemsCount: items.length.toString(),
-        subtotal: subtotal.toString(),
-        tax: tax.toString(),
-        shipping: shipping.toString(),
-        total: total.toString()
-      },
+      metadata: sessionMetadata,
       success_url: `${process.env.CLIENT_URL}/checkout/success?session_id={CHECKOUT_SESSION_ID}&order_id=${orderId}`,
       cancel_url: `${process.env.CLIENT_URL}/checkout/cancel?session_id={CHECKOUT_SESSION_ID}`,
       expires_at: Math.floor(Date.now() / 1000) + (30 * 60), // 30 minutes
     });
 
-    // Create pending order in database
-    await ordersCollection.insertOne({
+    // ✅ Create pending order in database with coupon info
+    const orderData = {
       orderId: orderId,
       userId: userId,
       customer: {
@@ -2685,6 +3015,7 @@ app.post("/api/create-checkout-session", verifyFirebaseToken, async (req, res) =
       items: items,
       pricing: {
         subtotal: subtotal,
+        discount: discount,
         tax: tax,
         shipping: shipping,
         total: total
@@ -2699,7 +3030,19 @@ app.post("/api/create-checkout-session", verifyFirebaseToken, async (req, res) =
       status: 'pending',
       createdAt: new Date(),
       updatedAt: new Date()
-    });
+    };
+
+    // ✅ Add coupon info to order if applied
+    if (coupon) {
+      orderData.coupon = {
+        code: coupon.code,
+        type: coupon.type,
+        value: coupon.value || 0,
+        discount: discount
+      };
+    }
+
+    await ordersCollection.insertOne(orderData);
 
     console.log('✅ Checkout session created:', session.id);
     console.log('✅ Order created:', orderId);
@@ -2712,7 +3055,7 @@ app.post("/api/create-checkout-session", verifyFirebaseToken, async (req, res) =
     });
 
   } catch (error) {
-    console.error('Checkout session error:', error);
+    console.error('❌ Checkout session error:', error);
     res.status(500).json({
       success: false,
       message: 'Failed to create checkout session',
@@ -3088,6 +3431,396 @@ app.get("/api/orders/export/csv", verifyFirebaseToken, verifyAdmin, async (req, 
       success: false,
       message: 'Failed to export orders',
       error: error.message,
+    });
+  }
+});
+
+
+// ============================================
+// COUPON ROUTES
+// ============================================
+
+// GET - Get all coupons (Admin/Staff)
+app.get("/api/coupons", verifyFirebaseToken, verifyStaff, async (req, res) => {
+  try {
+    const { status, search } = req.query;
+    
+    const query = {};
+    
+    if (status && status !== 'all') {
+      query.status = status;
+    }
+    
+    if (search) {
+      query.code = { $regex: search, $options: 'i' };
+    }
+
+    const coupons = await couponsCollection
+      .find(query)
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.json({
+      success: true,
+      coupons
+    });
+  } catch (error) {
+    console.error('Get coupons error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch coupons',
+      error: error.message
+    });
+  }
+});
+
+// GET - Get single coupon by ID (Admin/Staff)
+app.get("/api/coupons/:id", verifyFirebaseToken, verifyStaff, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const coupon = await couponsCollection.findOne({
+      _id: new ObjectId(id)
+    });
+
+    if (!coupon) {
+      return res.status(404).json({
+        success: false,
+        message: 'Coupon not found'
+      });
+    }
+
+    res.json({
+      success: true,
+      coupon
+    });
+  } catch (error) {
+    console.error('Get coupon error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch coupon',
+      error: error.message
+    });
+  }
+});
+
+// POST - Create new coupon (Admin only)
+app.post("/api/coupons", verifyFirebaseToken, verifyAdmin, async (req, res) => {
+  try {
+    const {
+      code,
+      type,
+      value,
+      minOrder,
+      maxDiscount,
+      limit,
+      startDate,
+      endDate,
+      status
+    } = req.body;
+
+    // Validation
+    if (!code || !type || !limit || !startDate || !endDate) {
+      return res.status(400).json({
+        success: false,
+        message: 'Missing required fields'
+      });
+    }
+
+    // Check if code already exists
+    const existing = await couponsCollection.findOne({
+      code: code.toUpperCase()
+    });
+
+    if (existing) {
+      return res.status(400).json({
+        success: false,
+        message: 'Coupon code already exists'
+      });
+    }
+
+    const newCoupon = {
+      code: code.toUpperCase(),
+      type, // 'percentage', 'fixed', 'free_shipping'
+      value: type === 'free_shipping' ? 0 : parseFloat(value),
+      minOrder: parseFloat(minOrder) || 0,
+      maxDiscount: maxDiscount ? parseFloat(maxDiscount) : null,
+      usage: 0,
+      limit: parseInt(limit),
+      startDate: new Date(startDate),
+      endDate: new Date(endDate),
+      status: status || 'active',
+      createdAt: new Date(),
+      updatedAt: new Date()
+    };
+
+    const result = await couponsCollection.insertOne(newCoupon);
+
+    res.status(201).json({
+      success: true,
+      message: 'Coupon created successfully',
+      coupon: {
+        _id: result.insertedId,
+        ...newCoupon
+      }
+    });
+  } catch (error) {
+    console.error('Create coupon error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to create coupon',
+      error: error.message
+    });
+  }
+});
+
+// PUT - Update coupon (Admin only)
+app.put("/api/coupons/:id", verifyFirebaseToken, verifyAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const updateData = req.body;
+
+    delete updateData._id;
+    delete updateData.usage; // Don't allow manual usage update
+    
+    updateData.updatedAt = new Date();
+
+    // If code is being updated, check uniqueness
+    if (updateData.code) {
+      const existing = await couponsCollection.findOne({
+        code: updateData.code.toUpperCase(),
+        _id: { $ne: new ObjectId(id) }
+      });
+
+      if (existing) {
+        return res.status(400).json({
+          success: false,
+          message: 'Coupon code already exists'
+        });
+      }
+
+      updateData.code = updateData.code.toUpperCase();
+    }
+
+    const result = await couponsCollection.updateOne(
+      { _id: new ObjectId(id) },
+      { $set: updateData }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Coupon not found'
+      });
+    }
+
+    const updatedCoupon = await couponsCollection.findOne({
+      _id: new ObjectId(id)
+    });
+
+    res.json({
+      success: true,
+      message: 'Coupon updated successfully',
+      coupon: updatedCoupon
+    });
+  } catch (error) {
+    console.error('Update coupon error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to update coupon',
+      error: error.message
+    });
+  }
+});
+
+// DELETE - Delete coupon (Admin only)
+app.delete("/api/coupons/:id", verifyFirebaseToken, verifyAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const result = await couponsCollection.deleteOne({
+      _id: new ObjectId(id)
+    });
+
+    if (result.deletedCount === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Coupon not found'
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'Coupon deleted successfully'
+    });
+  } catch (error) {
+    console.error('Delete coupon error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to delete coupon',
+      error: error.message
+    });
+  }
+});
+
+// ============================================
+// PUBLIC COUPON VALIDATION (For users)
+// ============================================
+
+// POST - Validate and apply coupon
+app.post("/api/coupons/validate", async (req, res) => {
+  try {
+    const { code, cartTotal } = req.body;
+
+    if (!code) {
+      return res.status(400).json({
+        success: false,
+        message: 'Coupon code is required'
+      });
+    }
+
+    const coupon = await couponsCollection.findOne({
+      code: code.toUpperCase(),
+      status: 'active'
+    });
+
+    if (!coupon) {
+      return res.status(404).json({
+        success: false,
+        message: 'Invalid coupon code'
+      });
+    }
+
+    // Check if expired
+    const now = new Date();
+    if (now < new Date(coupon.startDate) || now > new Date(coupon.endDate)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Coupon has expired'
+      });
+    }
+
+    // Check usage limit
+    if (coupon.usage >= coupon.limit) {
+      return res.status(400).json({
+        success: false,
+        message: 'Coupon usage limit reached'
+      });
+    }
+
+    // Check minimum order
+    if (cartTotal < coupon.minOrder) {
+      return res.status(400).json({
+        success: false,
+        message: `Minimum order amount is $${coupon.minOrder}`
+      });
+    }
+
+    // Calculate discount
+    let discount = 0;
+    
+    if (coupon.type === 'percentage') {
+      discount = (cartTotal * coupon.value) / 100;
+      if (coupon.maxDiscount && discount > coupon.maxDiscount) {
+        discount = coupon.maxDiscount;
+      }
+    } else if (coupon.type === 'fixed') {
+      discount = coupon.value;
+      if (discount > cartTotal) {
+        discount = cartTotal;
+      }
+    }
+    // For free_shipping, discount is handled separately in checkout
+
+    res.json({
+      success: true,
+      message: 'Coupon applied successfully',
+      coupon: {
+        code: coupon.code,
+        type: coupon.type,
+        value: coupon.value,
+        discount: discount
+      }
+    });
+  } catch (error) {
+    console.error('Validate coupon error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to validate coupon',
+      error: error.message
+    });
+  }
+});
+
+// POST - Increment coupon usage (called after successful order)
+app.post("/api/coupons/use/:code", async (req, res) => {
+  try {
+    const { code } = req.params;
+
+    const result = await couponsCollection.updateOne(
+      { code: code.toUpperCase() },
+      { 
+        $inc: { usage: 1 },
+        $set: { updatedAt: new Date() }
+      }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Coupon not found'
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'Coupon usage updated'
+    });
+  } catch (error) {
+    console.error('Use coupon error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to update coupon usage',
+      error: error.message
+    });
+  }
+});
+
+// GET - Coupon statistics (Admin)
+app.get("/api/coupons/stats/overview", verifyFirebaseToken, verifyAdmin, async (req, res) => {
+  try {
+    const totalCoupons = await couponsCollection.countDocuments();
+    const activeCoupons = await couponsCollection.countDocuments({ status: 'active' });
+    
+    const now = new Date();
+    const expiredCoupons = await couponsCollection.countDocuments({
+      endDate: { $lt: now }
+    });
+
+    const totalUsage = await couponsCollection.aggregate([
+      {
+        $group: {
+          _id: null,
+          total: { $sum: '$usage' }
+        }
+      }
+    ]).toArray();
+
+    res.json({
+      success: true,
+      stats: {
+        totalCoupons,
+        activeCoupons,
+        expiredCoupons,
+        totalUsage: totalUsage[0]?.total || 0
+      }
+    });
+  } catch (error) {
+    console.error('Get coupon stats error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch coupon statistics',
+      error: error.message
     });
   }
 });
