@@ -493,6 +493,13 @@ async function handleSuccessfulPayment(session) {
       return;
     }
 
+    // ✅ IDEMPOTENCY CHECK — skip if already paid by verify route
+    const existingOrder = await ordersCollection.findOne({ orderId: orderId });
+    if (existingOrder?.payment?.status === 'paid') {
+      console.log('⚠️ Order already marked as paid (by verify route), skipping webhook duplicate');
+      return;
+    }
+
     // Get payment intent details
     const paymentIntent = await stripe.paymentIntents.retrieve(paymentIntentId);
     console.log('✅ Payment Intent retrieved');
@@ -3083,26 +3090,96 @@ app.get("/api/checkout/verify/:sessionId", verifyFirebaseToken, async (req, res)
 
     const orderId = session.client_reference_id;
 
-    // Get order from database
-    const order = await ordersCollection.findOne({ orderId: orderId });
+    if (!orderId) {
+      return res.status(400).json({
+        success: false,
+        message: 'Order ID not found in session'
+      });
+    }
 
-    if (!order) {
+    // Check if already paid — return the existing updated order immediately
+    const existingOrder = await ordersCollection.findOne({ orderId: orderId });
+
+    if (!existingOrder) {
       return res.status(404).json({
         success: false,
         message: 'Order not found'
       });
     }
 
-    res.json({
+    // If already marked paid (idempotency), just return current state
+    if (existingOrder?.payment?.status === 'paid') {
+      console.log('⚠️ Order already paid, returning existing data');
+      return res.json({
+        success: true,
+        paymentStatus: 'paid',
+        orderStatus: existingOrder.status,
+        order: existingOrder
+      });
+    }
+
+    // Stripe says paid → update order in DB
+    if (session.payment_status === 'paid') {
+      console.log('✅ Payment confirmed, updating order:', orderId);
+
+      // 1. Update order payment status
+      await ordersCollection.updateOne(
+        { orderId: orderId },
+        {
+          $set: {
+            'payment.status': 'paid',
+            'payment.stripeSessionId': session.id,
+            'payment.stripePaymentIntentId': session.payment_intent,
+            'payment.paidAt': new Date(),
+            status: 'processing',
+            updatedAt: new Date()
+          }
+        }
+      );
+
+      // 2. Clear the cart
+      if (existingOrder?.userId) {
+        await cartsCollection.updateOne(
+          { userId: existingOrder.userId },
+          { $set: { items: [], updatedAt: new Date() } }
+        );
+        console.log('✅ Cart cleared for user:', existingOrder.userId);
+      }
+
+      // 3. Update product stock
+      if (existingOrder?.items?.length > 0) {
+        for (const item of existingOrder.items) {
+          try {
+            await productsCollection.updateOne(
+              { _id: new ObjectId(item.productId) },
+              { 
+                $inc: { stock: -item.qty, soldCount: item.qty },
+                $set: { updatedAt: new Date() }
+              }
+            );
+            console.log(`✅ Stock updated: ${item.productId} (-${item.qty})`);
+          } catch (stockErr) {
+            console.error(`❌ Stock update failed for ${item.productId}:`, stockErr.message);
+          }
+        }
+      }
+    }
+
+    // Return the final updated order
+    const updatedOrder = await ordersCollection.findOne({ orderId: orderId });
+
+    console.log('✅ Verify complete. Payment:', updatedOrder?.payment?.status, '| Order:', updatedOrder?.status);
+
+    return res.json({
       success: true,
       paymentStatus: session.payment_status,
-      orderStatus: order.status,
-      order: order
+      orderStatus: updatedOrder?.status,
+      order: updatedOrder
     });
 
   } catch (error) {
-    console.error('Payment verification error:', error);
-    res.status(500).json({
+    console.error('❌ Payment verification error:', error);
+    return res.status(500).json({
       success: false,
       message: 'Failed to verify payment',
       error: error.message
