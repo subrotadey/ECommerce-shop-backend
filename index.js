@@ -1118,6 +1118,324 @@ app.get("/api/admin/stats/users", verifyFirebaseToken, verifyAdmin, async (req, 
   }
 });
 
+
+// ROUTE 1: MAIN DASHBOARD STATS
+// GET /api/admin/stats/dashboard
+// Returns: revenue, orders, customers, products + growth %
+// ============================================
+app.get("/api/admin/stats/dashboard", verifyFirebaseToken, verifyAdmin, async (req, res) => {
+  try {
+    const now = new Date();
+ 
+    // ── Date boundaries ──────────────────────────────────────────────
+    const startOfThisMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+    const startOfLastMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+    const endOfLastMonth   = new Date(now.getFullYear(), now.getMonth(), 0, 23, 59, 59, 999);
+ 
+    // ── Revenue ─────────────────────────────────────────────────────
+    const revenueAgg = await ordersCollection.aggregate([
+      { $match: { "payment.status": "paid" } },
+      {
+        $group: {
+          _id: {
+            month: { $month: "$createdAt" },
+            year:  { $year:  "$createdAt" }
+          },
+          revenue: { $sum: "$pricing.total" }
+        }
+      }
+    ]).toArray();
+ 
+    const totalRevenue = revenueAgg.reduce((s, r) => s + r.revenue, 0);
+ 
+    // This month vs last month revenue
+    const thisMonthRevAgg = await ordersCollection.aggregate([
+      { $match: { "payment.status": "paid", createdAt: { $gte: startOfThisMonth } } },
+      { $group: { _id: null, revenue: { $sum: "$pricing.total" } } }
+    ]).toArray();
+ 
+    const lastMonthRevAgg = await ordersCollection.aggregate([
+      { $match: { "payment.status": "paid", createdAt: { $gte: startOfLastMonth, $lte: endOfLastMonth } } },
+      { $group: { _id: null, revenue: { $sum: "$pricing.total" } } }
+    ]).toArray();
+ 
+    const thisMonthRevenue = thisMonthRevAgg[0]?.revenue || 0;
+    const lastMonthRevenue = lastMonthRevAgg[0]?.revenue || 0;
+    const revenueGrowth = lastMonthRevenue === 0
+      ? (thisMonthRevenue > 0 ? 100 : 0)
+      : parseFloat((((thisMonthRevenue - lastMonthRevenue) / lastMonthRevenue) * 100).toFixed(1));
+ 
+    // ── Orders ───────────────────────────────────────────────────────
+    const totalOrders     = await ordersCollection.countDocuments();
+    const thisMonthOrders = await ordersCollection.countDocuments({ createdAt: { $gte: startOfThisMonth } });
+    const lastMonthOrders = await ordersCollection.countDocuments({ createdAt: { $gte: startOfLastMonth, $lte: endOfLastMonth } });
+    const ordersGrowth    = lastMonthOrders === 0
+      ? (thisMonthOrders > 0 ? 100 : 0)
+      : parseFloat((((thisMonthOrders - lastMonthOrders) / lastMonthOrders) * 100).toFixed(1));
+ 
+    // ── Customers ────────────────────────────────────────────────────
+    const totalCustomers     = await usersCollection.countDocuments();
+    const thisMonthCustomers = await usersCollection.countDocuments({ createdAt: { $gte: startOfThisMonth } });
+    const lastMonthCustomers = await usersCollection.countDocuments({ createdAt: { $gte: startOfLastMonth, $lte: endOfLastMonth } });
+    const customersGrowth    = lastMonthCustomers === 0
+      ? (thisMonthCustomers > 0 ? 100 : 0)
+      : parseFloat((((thisMonthCustomers - lastMonthCustomers) / lastMonthCustomers) * 100).toFixed(1));
+ 
+    // ── Products ─────────────────────────────────────────────────────
+    const totalProducts = await productsCollection.countDocuments();
+    const thisMonthProducts = await productsCollection.countDocuments({ createdAt: { $gte: startOfThisMonth } });
+    const lastMonthProducts = await productsCollection.countDocuments({ createdAt: { $gte: startOfLastMonth, $lte: endOfLastMonth } });
+    const productsGrowth    = lastMonthProducts === 0
+      ? (thisMonthProducts > 0 ? 100 : 0)
+      : parseFloat((((thisMonthProducts - lastMonthProducts) / lastMonthProducts) * 100).toFixed(1));
+ 
+    // ── Recent Orders (last 5) ────────────────────────────────────────
+    const recentOrders = await ordersCollection
+      .find({})
+      .sort({ createdAt: -1 })
+      .limit(5)
+      .toArray();
+ 
+    res.json({
+      success: true,
+      stats: {
+        totalRevenue,
+        revenueGrowth,
+        thisMonthRevenue,
+        totalOrders,
+        ordersGrowth,
+        thisMonthOrders,
+        totalCustomers,
+        customersGrowth,
+        thisMonthCustomers,
+        totalProducts,
+        productsGrowth,
+        thisMonthProducts
+      },
+      recentOrders
+    });
+  } catch (error) {
+    console.error("Dashboard stats error:", error);
+    res.status(500).json({ success: false, message: "Failed to fetch dashboard stats", error: error.message });
+  }
+});
+
+// ============================================
+// COD ORDER ROUTE
+// ============================================
+app.post("/api/orders/cod", verifyFirebaseToken, async (req, res) => {
+  try {
+    const { items, userId, customerEmail, coupon, shippingAddress } = req.body;
+
+    if (!items || items.length === 0) {
+      return res.status(400).json({ success: false, message: "Cart is empty" });
+    }
+
+    const user = await usersCollection.findOne({ 
+      email: customerEmail.toLowerCase() 
+    });
+
+    // Calculate totals
+    const subtotal = items.reduce((sum, item) => sum + (item.price * item.qty), 0);
+    
+    let discount = 0;
+    if (coupon) {
+      if (coupon.type === 'percentage') {
+        discount = coupon.discount || 0;
+      } else if (coupon.type === 'fixed') {
+        discount = Math.min(coupon.discount || coupon.value || 0, subtotal);
+      }
+    }
+
+    const tax = (subtotal - discount) * 0.05;
+    const shipping = coupon?.type === 'free_shipping' || subtotal > 1000 ? 0 : 100;
+    const total = subtotal - discount + tax + shipping;
+
+    const orderId = `ORD-${Date.now()}-${Math.random().toString(36).substr(2, 9).toUpperCase()}`;
+
+    const orderData = {
+      orderId,
+      userId,
+      customer: {
+        email: customerEmail,
+        name: user?.displayName || 'Guest',
+        phone: user?.phoneNumber || '',
+        address: shippingAddress || user?.address || {}
+      },
+      items,
+      pricing: { subtotal, discount, tax, shipping, total },
+      payment: {
+        method: 'cod',
+        status: 'pending', // COD তে pending থাকবে delivery পর্যন্ত
+      },
+      status: 'pending',
+      createdAt: new Date(),
+      updatedAt: new Date()
+    };
+
+    if (coupon) {
+      orderData.coupon = {
+        code: coupon.code,
+        type: coupon.type,
+        value: coupon.value || 0,
+        discount
+      };
+    }
+
+    await ordersCollection.insertOne(orderData);
+
+    // Cart clear করো
+    await cartsCollection.updateOne(
+      { userId },
+      { $set: { items: [], updatedAt: new Date() } }
+    );
+
+    // Stock update
+    for (const item of items) {
+      try {
+        await productsCollection.updateOne(
+          { _id: new ObjectId(item.productId) },
+          { $inc: { stock: -item.qty }, $set: { updatedAt: new Date() } }
+        );
+      } catch (e) {
+        console.error('Stock update failed:', e.message);
+      }
+    }
+
+    res.status(201).json({
+      success: true,
+      message: 'Order placed successfully',
+      orderId,
+      order: orderData
+    });
+
+  } catch (error) {
+    console.error('COD order error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to place order',
+      error: error.message
+    });
+  }
+});
+
+
+// ============================================
+// ROUTE 2: REVENUE CHART DATA (Last 12 months)
+// GET /api/admin/stats/revenue-chart
+// ============================================
+app.get("/api/admin/stats/revenue-chart", verifyFirebaseToken, verifyAdmin, async (req, res) => {
+  try {
+    const now = new Date();
+    // Go back 11 months from current month
+    const twelveMonthsAgo = new Date(now.getFullYear(), now.getMonth() - 11, 1);
+ 
+    const rawData = await ordersCollection.aggregate([
+      {
+        $match: {
+          "payment.status": "paid",
+          createdAt: { $gte: twelveMonthsAgo }
+        }
+      },
+      {
+        $group: {
+          _id: {
+            year:  { $year:  "$createdAt" },
+            month: { $month: "$createdAt" }
+          },
+          revenue: { $sum: "$pricing.total" },
+          orders:  { $sum: 1 }
+        }
+      },
+      { $sort: { "_id.year": 1, "_id.month": 1 } }
+    ]).toArray();
+ 
+    // Build a full 12-month array (fill zeros for months with no data)
+    const monthNames = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+    const chartData = [];
+ 
+    for (let i = 11; i >= 0; i--) {
+      const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+      const year  = d.getFullYear();
+      const month = d.getMonth() + 1; // 1-based
+ 
+      const found = rawData.find(r => r._id.year === year && r._id.month === month);
+ 
+      chartData.push({
+        month:   monthNames[d.getMonth()],
+        year,
+        revenue: found ? parseFloat(found.revenue.toFixed(2)) : 0,
+        orders:  found ? found.orders : 0
+      });
+    }
+ 
+    res.json({ success: true, chartData });
+  } catch (error) {
+    console.error("Revenue chart error:", error);
+    res.status(500).json({ success: false, message: "Failed to fetch chart data", error: error.message });
+  }
+});
+
+
+// ============================================
+// ROUTE 3: TOP PRODUCTS BY REVENUE & SALES
+// GET /api/admin/stats/top-products
+// ============================================
+app.get("/api/admin/stats/top-products", verifyFirebaseToken, verifyAdmin, async (req, res) => {
+  try {
+    // Aggregate from paid orders → unwind items → group by productId
+    const topProducts = await ordersCollection.aggregate([
+      { $match: { "payment.status": "paid" } },
+      { $unwind: "$items" },
+      {
+        $group: {
+          _id:     "$items.productId",
+          name:    { $first: "$items.name" },
+          image:   { $first: "$items.image" },
+          sales:   { $sum: "$items.qty" },
+          revenue: { $sum: { $multiply: ["$items.price", "$items.qty"] } }
+        }
+      },
+      { $sort: { revenue: -1 } },
+      { $limit: 5 },
+      {
+        $lookup: {
+          from:         "products",
+          let:          { pid: "$_id" },
+          pipeline: [
+            { $match: { $expr: { $eq: [{ $toString: "$_id" }, "$$pid"] } } },
+            { $project: { productName: 1, images: 1, media: 1 } }
+          ],
+          as: "productInfo"
+        }
+      },
+      {
+        $project: {
+          _id:     0,
+          productId: "$_id",
+          name:    { $ifNull: [{ $arrayElemAt: ["$productInfo.productName", 0] }, "$name"] },
+          image: {
+            $ifNull: [
+              { $arrayElemAt: [{ $arrayElemAt: ["$productInfo.media.images.url", 0] }, 0] },
+              { $arrayElemAt: [{ $arrayElemAt: ["$productInfo.images.url", 0] }, 0] },
+              "$image"
+            ]
+          },
+          sales:   1,
+          revenue: { $round: ["$revenue", 2] }
+        }
+      }
+    ]).toArray();
+ 
+    res.json({ success: true, topProducts });
+  } catch (error) {
+    console.error("Top products error:", error);
+    res.status(500).json({ success: false, message: "Failed to fetch top products", error: error.message });
+  }
+});
+
+
+
 // ============================================
 // BATCH UPDATE USER ROLES (Admin Only)
 // ============================================
