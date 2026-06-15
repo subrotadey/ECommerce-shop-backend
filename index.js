@@ -3231,23 +3231,34 @@ app.post("/api/create-checkout-session", verifyFirebaseToken, async (req, res) =
     const orderId = `ORD-${Date.now()}-${Math.random().toString(36).substr(2, 9).toUpperCase()}`;
 
     // Convert items to Stripe line items
-    const lineItems = items.map(item => ({
-      price_data: {
-        currency: 'bdt',
-        product_data: {
-          name: item.name,
-          description: `${item.size ? `Size: ${item.size}` : ''} ${item.color ? `Color: ${item.color}` : ''}`.trim(),
-          images: [item.image],
-          metadata: {
-            productId: item.productId,
-            size: item.size || 'N/A',
-            color: item.color || 'N/A'
-          }
-        },
-        unit_amount: Math.round(item.price * 100), // Convert to paisa
+    const lineItems = items.map(item => {
+  // Extract URL from image (handles string or object)
+  let imageUrl = '';
+  if (typeof item.image === 'string') {
+    try {
+      const parsed = JSON.parse(item.image);
+      imageUrl = parsed.url || '';
+    } catch {
+      imageUrl = item.image; // already a plain URL
+    }
+  } else if (typeof item.image === 'object' && item.image?.url) {
+    imageUrl = item.image.url;
+  }
+
+  return {
+    price_data: {
+      currency: 'bdt',
+      product_data: {
+        name: item.name,
+        description: `${item.size ? `Size: ${item.size}` : ''} ${item.color ? `Color: ${item.color}` : ''}`.trim() || undefined,
+        images: imageUrl ? [imageUrl] : [],
+        // ...
       },
-      quantity: item.qty,
-    }));
+      unit_amount: Math.round(item.price * 100),
+    },
+    quantity: item.qty,
+  };
+});
 
     // ✅ Add discount as negative line item if coupon applied
     if (discount > 0) {
