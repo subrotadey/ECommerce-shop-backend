@@ -41,7 +41,7 @@ app.use(cors({
 
 app.use(cookieParser());
 
-let ordersCollection, cartsCollection, productsCollection, usersCollection, wishlistsCollection, couponsCollection;;
+let addressesCollection, ordersCollection, cartsCollection, productsCollection, usersCollection, wishlistsCollection, couponsCollection;;
 
 // Add this BEFORE express.json() middleware
 app.post("/api/webhook", 
@@ -616,6 +616,7 @@ async function run() {
     usersCollection = database.collection("users")
     ordersCollection = database.collection("orders");
     couponsCollection = database.collection("coupons");
+    addressesCollection = database.collection("addresses");
 
     console.log("All collections initialized");
 
@@ -4216,6 +4217,260 @@ app.get("/api/coupons/stats/overview", verifyFirebaseToken, verifyAdmin, async (
       success: false,
       message: 'Failed to fetch coupon statistics',
       error: error.message
+    });
+  }
+});
+
+
+// ============================================
+// 🆕 ADDRESS MANAGEMENT ROUTES
+// Paste this block inside run(), after the Coupon routes
+// and BEFORE the closing "  } catch (err) {" of run()
+// ============================================
+
+// Helper: convert _id -> id and attach for frontend consistency
+const formatAddress = (addr) => ({
+  ...addr,
+  id: addr._id.toString(),
+  _id: undefined,
+});
+
+// GET - Get all addresses for logged-in user
+app.get("/api/addresses", verifyFirebaseToken, async (req, res) => {
+  try {
+    const addresses = await addressesCollection
+      .find({ userId: req.uid })
+      .sort({ isDefault: -1, createdAt: -1 })
+      .toArray();
+
+    res.status(200).json({
+      success: true,
+      addresses: addresses.map(formatAddress),
+    });
+  } catch (error) {
+    console.error('Get addresses error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch addresses',
+      error: error.message,
+    });
+  }
+});
+
+// POST - Add a new address
+app.post("/api/addresses", verifyFirebaseToken, async (req, res) => {
+  try {
+    const {
+      fullName, phone, altPhone, street, aptNumber, city, state,
+      zipCode, country, label, isDefault, deliveryNote, landmark, timePreference,
+    } = req.body;
+
+    // Basic required field check (mirrors validateAddress on frontend)
+    if (!fullName || !phone || !street || !city || !state || !zipCode || !country) {
+      return res.status(400).json({
+        success: false,
+        message: 'Missing required address fields',
+      });
+    }
+
+    // Check existing addresses count (limit 5, matches frontend hint)
+    const existingCount = await addressesCollection.countDocuments({ userId: req.uid });
+    if (existingCount >= 5) {
+      return res.status(400).json({
+        success: false,
+        message: 'Maximum 5 addresses allowed. Please delete one to add a new address.',
+      });
+    }
+
+    // If this is the user's first address, force it to be default
+    const shouldBeDefault = existingCount === 0 ? true : !!isDefault;
+
+    // If marking this as default, unset previous defaults
+    if (shouldBeDefault) {
+      await addressesCollection.updateMany(
+        { userId: req.uid },
+        { $set: { isDefault: false } }
+      );
+    }
+
+    const newAddress = {
+      userId: req.uid,
+      fullName,
+      phone,
+      altPhone: altPhone || '',
+      street,
+      aptNumber: aptNumber || '',
+      city,
+      state,
+      zipCode,
+      country,
+      label: label || 'home',
+      isDefault: shouldBeDefault,
+      deliveryNote: deliveryNote || '',
+      landmark: landmark || '',
+      timePreference: timePreference || '',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+
+    const result = await addressesCollection.insertOne(newAddress);
+
+    res.status(201).json({
+      success: true,
+      message: 'Address added successfully',
+      address: formatAddress({ ...newAddress, _id: result.insertedId }),
+    });
+  } catch (error) {
+    console.error('Add address error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to add address',
+      error: error.message,
+    });
+  }
+});
+
+// PUT - Update an existing address
+app.put("/api/addresses/:id", verifyFirebaseToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const updateData = req.body;
+
+    delete updateData._id;
+    delete updateData.id;
+    delete updateData.userId;
+    updateData.updatedAt = new Date();
+
+    // Ownership check
+    const existing = await addressesCollection.findOne({
+      _id: new ObjectId(id),
+      userId: req.uid,
+    });
+
+    if (!existing) {
+      return res.status(404).json({
+        success: false,
+        message: 'Address not found',
+      });
+    }
+
+    // If setting this as default, unset others first
+    if (updateData.isDefault) {
+      await addressesCollection.updateMany(
+        { userId: req.uid, _id: { $ne: new ObjectId(id) } },
+        { $set: { isDefault: false } }
+      );
+    }
+
+    await addressesCollection.updateOne(
+      { _id: new ObjectId(id) },
+      { $set: updateData }
+    );
+
+    const updated = await addressesCollection.findOne({ _id: new ObjectId(id) });
+
+    res.status(200).json({
+      success: true,
+      message: 'Address updated successfully',
+      address: formatAddress(updated),
+    });
+  } catch (error) {
+    console.error('Update address error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to update address',
+      error: error.message,
+    });
+  }
+});
+
+// DELETE - Delete an address
+app.delete("/api/addresses/:id", verifyFirebaseToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const existing = await addressesCollection.findOne({
+      _id: new ObjectId(id),
+      userId: req.uid,
+    });
+
+    if (!existing) {
+      return res.status(404).json({
+        success: false,
+        message: 'Address not found',
+      });
+    }
+
+    await addressesCollection.deleteOne({ _id: new ObjectId(id) });
+
+    // If the deleted address was default, promote the most recent remaining one
+    if (existing.isDefault) {
+      const next = await addressesCollection
+        .find({ userId: req.uid })
+        .sort({ createdAt: -1 })
+        .limit(1)
+        .toArray();
+
+      if (next.length > 0) {
+        await addressesCollection.updateOne(
+          { _id: next[0]._id },
+          { $set: { isDefault: true } }
+        );
+      }
+    }
+
+    res.status(200).json({
+      success: true,
+      message: 'Address deleted successfully',
+    });
+  } catch (error) {
+    console.error('Delete address error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to delete address',
+      error: error.message,
+    });
+  }
+});
+
+// PATCH - Set an address as default
+app.patch("/api/addresses/:id/default", verifyFirebaseToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const existing = await addressesCollection.findOne({
+      _id: new ObjectId(id),
+      userId: req.uid,
+    });
+
+    if (!existing) {
+      return res.status(404).json({
+        success: false,
+        message: 'Address not found',
+      });
+    }
+
+    // Unset all, then set this one
+    await addressesCollection.updateMany(
+      { userId: req.uid },
+      { $set: { isDefault: false } }
+    );
+
+    await addressesCollection.updateOne(
+      { _id: new ObjectId(id) },
+      { $set: { isDefault: true, updatedAt: new Date() } }
+    );
+
+    res.status(200).json({
+      success: true,
+      message: 'Default address updated successfully',
+    });
+  } catch (error) {
+    console.error('Set default address error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to set default address',
+      error: error.message,
     });
   }
 });
