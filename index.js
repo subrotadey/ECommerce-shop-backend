@@ -18,6 +18,7 @@ const allowedOrigins = [
   "http://localhost:5173",
   "http://localhost:3000",
   process.env.CLIENT_URL,
+  "https://anisabaya.vercel.app/",
   "https://anis-abaiya.web.app",
   "https://anis-abaiya.firebaseapp.com"
 ].filter(Boolean); // Remove undefined values
