@@ -49,7 +49,7 @@ app.post("/api/webhook",
   express.raw({ type: 'application/json' }), 
   async (req, res) => {
     console.log('\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-    console.log('🔔 STRIPE WEBHOOK RECEIVED');
+    console.log(' STRIPE WEBHOOK RECEIVED');
     console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
     
     const sig = req.headers['stripe-signature'];
@@ -119,6 +119,7 @@ app.post("/api/webhook",
     } catch (error) {
       console.error('❌ Error processing webhook:', error);
       console.error('   Stack:', error.stack);
+      return res.status(500).json({ received: false, error: 'Webhook processing failed' });
     }
 
     console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
@@ -318,13 +319,254 @@ const verifyEmailToken = (req, res, next) => {
         next()
 }
 
+const blockTestInProd = (req, res, next) => {
+  if (process.env.NODE_ENV === 'production') {
+    return res.status(404).json({ success: false, message: 'Not found' });
+  }
+  next();
+};
+
+const verifyCartOwner = (req, res, next) => {
+  const requested = decodeURIComponent(req.params.userId || '').toLowerCase();
+  const email = (req.tokenEmail || '').toLowerCase();
+  const uid = (req.uid || '').toLowerCase();
+  if (!requested || (requested !== email && requested !== uid)) {
+    return res.status(403).json({
+      success: false,
+      message: 'You can only access your own cart'
+    });
+  }
+  next();
+};
+
+async function priceCartItems(rawItems) {
+  if (!Array.isArray(rawItems) || rawItems.length === 0) {
+    const err = new Error('Cart is empty');
+    err.status = 400;
+    throw err;
+  }
+
+  const priced = [];
+  for (const item of rawItems) {
+    const qty = Number(item.qty);
+    if (!item.productId || !qty || qty < 1) {
+      const err = new Error('Invalid cart item');
+      err.status = 400;
+      throw err;
+    }
+
+    let product;
+    try {
+      product = await productsCollection.findOne({ _id: new ObjectId(item.productId) });
+    } catch {
+      const err = new Error('Invalid product id');
+      err.status = 400;
+      throw err;
+    }
+
+    if (!product || (product.status && product.status !== 'active')) {
+      const err = new Error(`Product not available: ${item.name || item.productId}`);
+      err.status = 400;
+      throw err;
+    }
+
+    if ((product.stock ?? 0) < qty) {
+      const err = new Error(`Insufficient stock for ${product.productName}`);
+      err.status = 400;
+      throw err;
+    }
+
+    priced.push({
+      key: item.key,
+      productId: String(item.productId),
+      sku: product.sku || item.sku || '',
+      name: product.productName,
+      price: Number(product.newPrice),
+      oldPrice: product.oldPrice,
+      image: item.image || product.images?.[0] || '',
+      size: item.size ?? null,
+      color: item.color ?? null,
+      qty
+    });
+  }
+  return priced;
+}
+
+function computeOrderTotals(pricedItems, couponDoc) {
+  const subtotal = pricedItems.reduce((sum, item) => sum + (item.price * item.qty), 0);
+  let discount = 0;
+  if (couponDoc) {
+    if (couponDoc.type === 'percentage') {
+      discount = (subtotal * (couponDoc.value || 0)) / 100;
+      if (couponDoc.maxDiscount && discount > couponDoc.maxDiscount) {
+        discount = couponDoc.maxDiscount;
+      }
+    } else if (couponDoc.type === 'fixed') {
+      discount = Math.min(couponDoc.value || 0, subtotal);
+    }
+  }
+  const tax = (subtotal - discount) * 0.05;
+  const shipping = couponDoc?.type === 'free_shipping' || subtotal > 1000 ? 0 : 100;
+  const total = subtotal - discount + tax + shipping;
+  return { subtotal, discount, tax, shipping, total };
+}
+
+async function loadValidCoupon(code, subtotal) {
+  if (!code) return null;
+
+  const coupon = await couponsCollection.findOne({
+    code: String(code).toUpperCase(),
+    status: 'active'
+  });
+
+  if (!coupon) {
+    const err = new Error('Invalid coupon code');
+    err.status = 400;
+    throw err;
+  }
+
+  const now = new Date();
+  if (now < new Date(coupon.startDate) || now > new Date(coupon.endDate)) {
+    const err = new Error('Coupon has expired');
+    err.status = 400;
+    throw err;
+  }
+
+  if (coupon.limit && coupon.usage >= coupon.limit) {
+    const err = new Error('Coupon usage limit reached');
+    err.status = 400;
+    throw err;
+  }
+
+  if ((coupon.minOrder || 0) > subtotal) {
+    const err = new Error(`Minimum order amount is ${coupon.minOrder}`);
+    err.status = 400;
+    throw err;
+  }
+
+  return coupon;
+}
+
+async function decrementStock(items) {
+  for (const item of items) {
+    const result = await productsCollection.updateOne(
+      { _id: new ObjectId(item.productId), stock: { $gte: item.qty } },
+      {
+        $inc: { stock: -item.qty, soldCount: item.qty },
+        $set: { updatedAt: new Date() }
+      }
+    );
+    if (result.modifiedCount === 0) {
+      const err = new Error(`Insufficient stock for ${item.name}`);
+      err.status = 400;
+      throw err;
+    }
+  }
+}
+
+async function bumpCouponUsage(code) {
+  if (!code) return;
+  await couponsCollection.updateOne(
+    { code: String(code).toUpperCase() },
+    { $inc: { usage: 1 }, $set: { updatedAt: new Date() } }
+  );
+}
+
+async function createOfflineOrder({ req, paymentMethod, items, couponCode, shippingAddress }) {
+  const customerEmail = (req.tokenEmail || '').toLowerCase();
+  const userId = customerEmail;
+  const pricedItems = await priceCartItems(items);
+  const subtotal = pricedItems.reduce((sum, item) => sum + (item.price * item.qty), 0);
+  const couponDoc = await loadValidCoupon(couponCode, subtotal);
+  const pricing = computeOrderTotals(pricedItems, couponDoc);
+  const user = await usersCollection.findOne({ email: customerEmail });
+  const orderId = `ORD-${Date.now()}-${Math.random().toString(36).substr(2, 9).toUpperCase()}`;
+
+  const orderData = {
+    orderId,
+    userId,
+    customer: {
+      email: customerEmail,
+      name: user?.displayName || 'Guest',
+      phone: shippingAddress?.phone || user?.phoneNumber || '',
+      address: shippingAddress || user?.address || {}
+    },
+    items: pricedItems,
+    pricing,
+    payment: {
+      method: paymentMethod,
+      status: 'pending',
+    },
+    status: 'pending',
+    createdAt: new Date(),
+    updatedAt: new Date()
+  };
+
+  if (couponDoc) {
+    orderData.coupon = {
+      code: couponDoc.code,
+      type: couponDoc.type,
+      value: couponDoc.value || 0,
+      discount: pricing.discount
+    };
+  }
+
+  await decrementStock(pricedItems);
+  await ordersCollection.insertOne(orderData);
+  await cartsCollection.updateOne(
+    { userId },
+    { $set: { items: [], updatedAt: new Date() } }
+  );
+  await bumpCouponUsage(couponDoc?.code);
+
+  return orderData;
+}
+
+function unwrapFindOneAndUpdate(result) {
+  if (!result) return null;
+  if (Object.prototype.hasOwnProperty.call(result, 'value')) return result.value;
+  return result;
+}
+
+async function fulfillPaidOrder(orderId, extraPaymentFields = {}) {
+  const result = await ordersCollection.findOneAndUpdate(
+    { orderId, 'payment.status': 'pending' },
+    {
+      $set: {
+        'payment.status': 'paid',
+        status: 'processing',
+        updatedAt: new Date(),
+        ...extraPaymentFields
+      }
+    },
+    { returnDocument: 'after' }
+  );
+
+  const order = unwrapFindOneAndUpdate(result);
+  if (!order) return null;
+
+  if (order.userId) {
+    await cartsCollection.updateOne(
+      { userId: order.userId },
+      { $set: { items: [], updatedAt: new Date() } }
+    );
+  }
+
+  if (order.items?.length) {
+    await decrementStock(order.items);
+  }
+
+  await bumpCouponUsage(order.coupon?.code);
+  return order;
+}
+
 // ============================================
 // ADD THESE TEST ROUTES TO YOUR index.js
 // Place them after your middleware setup
 // ============================================
 
 // 🧪 TEST ROUTE 1: Check if token is received
-app.get("/api/test/token", async (req, res) => {
+app.get("/api/test/token", blockTestInProd, async (req, res) => {
   try {
     const authHeader = req.headers.authorization;
     
@@ -366,7 +608,7 @@ app.get("/api/test/token", async (req, res) => {
 });
 
 // 🧪 TEST ROUTE 2: Check Firebase token verification
-app.get("/api/test/verify-token", verifyFirebaseToken, async (req, res) => {
+app.get("/api/test/verify-token", blockTestInProd, verifyFirebaseToken, async (req, res) => {
   try {
     console.log('\n🧪 TOKEN VERIFICATION TEST');
     console.log('Token verified successfully!');
@@ -392,7 +634,7 @@ app.get("/api/test/verify-token", verifyFirebaseToken, async (req, res) => {
 });
 
 // 🧪 TEST ROUTE 3: Check admin access
-app.get("/api/test/admin", verifyFirebaseToken, verifyAdmin, async (req, res) => {
+app.get("/api/test/admin", blockTestInProd, verifyFirebaseToken, verifyAdmin, async (req, res) => {
   try {
     console.log('\n🧪 ADMIN ACCESS TEST');
     console.log('Admin verified!');
@@ -413,7 +655,7 @@ app.get("/api/test/admin", verifyFirebaseToken, verifyAdmin, async (req, res) =>
 });
 
 // 🧪 TEST ROUTE 4: Simple product test (no auth)
-app.get("/api/test/products", async (req, res) => {
+app.get("/api/test/products", blockTestInProd, async (req, res) => {
   try {
     const count = await productsCollection.countDocuments();
     const sample = await productsCollection.findOne();
@@ -438,7 +680,7 @@ app.get("/api/test/products", async (req, res) => {
 });
 
 // 🧪 TEST ROUTE 5: Test product delete (with auth)
-app.delete("/api/test/products/:id", verifyFirebaseToken, verifyAdmin, async (req, res) => {
+app.delete("/api/test/products/:id", blockTestInProd, verifyFirebaseToken, verifyAdmin, async (req, res) => {
   try {
     const id = req.params.id;
     
@@ -494,97 +736,30 @@ async function handleSuccessfulPayment(session) {
       return;
     }
 
-    // ✅ IDEMPOTENCY CHECK — skip if already paid by verify route
-    const existingOrder = await ordersCollection.findOne({ orderId: orderId });
-    if (existingOrder?.payment?.status === 'paid') {
-      console.log('⚠️ Order already marked as paid (by verify route), skipping webhook duplicate');
+    const extraPaymentFields = {
+      'payment.stripePaymentIntentId': paymentIntentId || null,
+      'payment.paidAt': new Date()
+    };
+
+    if (paymentIntentId) {
+      const paymentIntent = await stripe.paymentIntents.retrieve(paymentIntentId);
+      extraPaymentFields['payment.transactionId'] = paymentIntent.id;
+      extraPaymentFields['payment.amount'] = paymentIntent.amount / 100;
+      extraPaymentFields['payment.currency'] = paymentIntent.currency;
+    }
+
+    const order = await fulfillPaidOrder(orderId, extraPaymentFields);
+    if (!order) {
+      console.log('⚠️ Order already fulfilled or not pending:', orderId);
       return;
     }
 
-    // Get payment intent details
-    const paymentIntent = await stripe.paymentIntents.retrieve(paymentIntentId);
-    console.log('✅ Payment Intent retrieved');
-
-    // Update order
-    console.log('💾 Updating order in database...');
-    
-    const updateResult = await ordersCollection.updateOne(
-      { orderId: orderId },
-      {
-        $set: {
-          'payment.status': 'paid',
-          'payment.stripePaymentIntentId': paymentIntentId,
-          'payment.transactionId': paymentIntent.id,
-          'payment.paidAt': new Date(),
-          'payment.amount': paymentIntent.amount / 100,
-          'payment.currency': paymentIntent.currency,
-          status: 'processing',
-          updatedAt: new Date()
-        }
-      }
-    );
-
-    if (updateResult.modifiedCount > 0) {
-      console.log('✅ Order updated successfully');
-
-      const order = await ordersCollection.findOne({ orderId: orderId });
-      
-      if (!order) {
-        console.error('❌ Order not found after update');
-        return;
-      }
-
-      // Clear cart
-      if (order.userId) {
-        console.log('🛒 Clearing cart...');
-        
-        const cartResult = await cartsCollection.updateOne(
-          { userId: order.userId },
-          { $set: { items: [], updatedAt: new Date() } }
-        );
-        
-        if (cartResult.modifiedCount > 0) {
-          console.log('✅ Cart cleared');
-        } else {
-          console.log('⚠️ Cart not found or empty');
-        }
-      }
-
-      // Update stock
-      if (order.items && order.items.length > 0) {
-        console.log('📊 Updating product stocks...');
-        
-        for (const item of order.items) {
-          try {
-            const stockResult = await productsCollection.updateOne(
-              { _id: new ObjectId(item.productId) },
-              { 
-                $inc: { stock: -item.qty, soldCount: item.qty },
-                $set: { updatedAt: new Date() }
-              }
-            );
-            
-            if (stockResult.modifiedCount > 0) {
-              console.log(`   ✅ Stock updated: ${item.productId} (-${item.qty})`);
-            }
-          } catch (error) {
-            console.error(`   ❌ Stock update failed for ${item.productId}:`, error.message);
-          }
-        }
-        
-        console.log('✅ All stocks updated');
-      }
-
-      console.log('🎉 Payment processing complete!\n');
-
-    } else {
-      console.error('❌ Order not found in database:', orderId);
-    }
-
+    console.log('🎉 Payment processing complete!\n');
   } catch (error) {
     console.error('❌ ERROR in handleSuccessfulPayment:');
     console.error('   Message:', error.message);
     console.error('   Stack:', error.stack);
+    throw error;
   }
 }
 
@@ -663,12 +838,10 @@ async function run() {
       });
     });
 
-app.post("/jwt", (req, res) => {
-  const userData = req.body;
-
+app.post("/jwt", verifyFirebaseToken, (req, res) => {
   const token = jwt.sign(
     {
-      email: userData.email,
+      email: req.tokenEmail,
     }, 
     process.env.JWT_ACCESS_SECRET, 
     {
@@ -695,7 +868,9 @@ app.post("/jwt", (req, res) => {
     // POST - Register or update user (called after Firebase auth)
     app.post("/api/users/register", verifyFirebaseToken, async (req, res) => {
       try {
-        const { uid, email, displayName, photoURL, emailVerified, provider } = req.body;
+        const { displayName, photoURL, emailVerified, provider } = req.body;
+        const uid = req.uid;
+        const email = (req.tokenEmail || '').toLowerCase();
 
         // Validate required fields
         if (!uid || !email) {
@@ -905,7 +1080,7 @@ app.post("/jwt", (req, res) => {
     });
 
     // GET - Get user role by email (for frontend role checking)
-    app.get("/api/users/role/:email", async (req, res) => {
+    app.get("/api/users/role/:email", verifyFirebaseToken, async (req, res) => {
       try {
         const { email } = req.params;
 
@@ -916,8 +1091,20 @@ app.post("/jwt", (req, res) => {
           });
         }
 
+        const requested = email.toLowerCase();
+        const requester = (req.tokenEmail || '').toLowerCase();
+        if (requested !== requester) {
+          const requesterUser = await usersCollection.findOne({ email: requester });
+          if (!requesterUser || !['admin', 'staff', 'manager'].includes(requesterUser.role)) {
+            return res.status(403).json({
+              success: false,
+              message: 'Forbidden'
+            });
+          }
+        }
+
         const user = await usersCollection.findOne({ 
-          email: email.toLowerCase() 
+          email: requested 
         });
 
         if (!user) {
@@ -1227,96 +1414,52 @@ app.get("/api/admin/stats/dashboard", verifyFirebaseToken, verifyAdmin, async (r
 // ============================================
 app.post("/api/orders/cod", verifyFirebaseToken, async (req, res) => {
   try {
-    const { items, userId, customerEmail, coupon, shippingAddress } = req.body;
-
-    if (!items || items.length === 0) {
-      return res.status(400).json({ success: false, message: "Cart is empty" });
-    }
-
-    const user = await usersCollection.findOne({ 
-      email: customerEmail.toLowerCase() 
-    });
-
-    // Calculate totals
-    const subtotal = items.reduce((sum, item) => sum + (item.price * item.qty), 0);
-    
-    let discount = 0;
-    if (coupon) {
-      if (coupon.type === 'percentage') {
-        discount = coupon.discount || 0;
-      } else if (coupon.type === 'fixed') {
-        discount = Math.min(coupon.discount || coupon.value || 0, subtotal);
-      }
-    }
-
-    const tax = (subtotal - discount) * 0.05;
-    const shipping = coupon?.type === 'free_shipping' || subtotal > 1000 ? 0 : 100;
-    const total = subtotal - discount + tax + shipping;
-
-    const orderId = `ORD-${Date.now()}-${Math.random().toString(36).substr(2, 9).toUpperCase()}`;
-
-    const orderData = {
-      orderId,
-      userId,
-      customer: {
-        email: customerEmail,
-        name: user?.displayName || 'Guest',
-        phone: user?.phoneNumber || '',
-        address: shippingAddress || user?.address || {}
-      },
+    const { items, coupon, shippingAddress } = req.body;
+    const orderData = await createOfflineOrder({
+      req,
+      paymentMethod: 'cod',
       items,
-      pricing: { subtotal, discount, tax, shipping, total },
-      payment: {
-        method: 'cod',
-        status: 'pending', // COD তে pending থাকবে delivery পর্যন্ত
-      },
-      status: 'pending',
-      createdAt: new Date(),
-      updatedAt: new Date()
-    };
-
-    if (coupon) {
-      orderData.coupon = {
-        code: coupon.code,
-        type: coupon.type,
-        value: coupon.value || 0,
-        discount
-      };
-    }
-
-    await ordersCollection.insertOne(orderData);
-
-    // Cart clear করো
-    await cartsCollection.updateOne(
-      { userId },
-      { $set: { items: [], updatedAt: new Date() } }
-    );
-
-    // Stock update
-    for (const item of items) {
-      try {
-        await productsCollection.updateOne(
-          { _id: new ObjectId(item.productId) },
-          { $inc: { stock: -item.qty }, $set: { updatedAt: new Date() } }
-        );
-      } catch (e) {
-        console.error('Stock update failed:', e.message);
-      }
-    }
+      couponCode: coupon?.code,
+      shippingAddress
+    });
 
     res.status(201).json({
       success: true,
       message: 'Order placed successfully',
-      orderId,
+      orderId: orderData.orderId,
       order: orderData
     });
-
   } catch (error) {
     console.error('COD order error:', error);
-    res.status(500).json({
+    res.status(error.status || 500).json({
       success: false,
-      message: 'Failed to place order',
-      error: error.message
+      message: error.message || 'Failed to place order'
+    });
+  }
+});
+
+app.post("/api/orders/bank-deposit", verifyFirebaseToken, async (req, res) => {
+  try {
+    const { items, coupon, shippingAddress } = req.body;
+    const orderData = await createOfflineOrder({
+      req,
+      paymentMethod: 'bank_deposit',
+      items,
+      couponCode: coupon?.code,
+      shippingAddress
+    });
+
+    res.status(201).json({
+      success: true,
+      message: 'Order placed. Pay via bank deposit and share the receipt on WhatsApp.',
+      orderId: orderData.orderId,
+      order: orderData
+    });
+  } catch (error) {
+    console.error('Bank deposit order error:', error);
+    res.status(error.status || 500).json({
+      success: false,
+      message: error.message || 'Failed to place order'
     });
   }
 });
@@ -2162,7 +2305,7 @@ app.get("/api/customers/export/csv", verifyFirebaseToken, verifyAdmin, async (re
 
 
     // POST - Create new product
-app.post("/api/products", async (req, res) => {
+app.post("/api/products", verifyFirebaseToken, verifyAdmin, async (req, res) => {
   try {
     const productData = req.body;
 
@@ -2434,7 +2577,7 @@ app.delete("/api/products/:id", verifyFirebaseToken, verifyAdmin, async (req, re
 
 
     // PATCH - Update product status
-    app.patch("/api/products/:id/status", async (req, res) => {
+    app.patch("/api/products/:id/status", verifyFirebaseToken, verifyAdmin, async (req, res) => {
       try {
         const id = req.params.id;
         const { status } = req.body;
@@ -2489,7 +2632,7 @@ app.delete("/api/products/:id", verifyFirebaseToken, verifyAdmin, async (req, re
 // ============================================
 
 // DELETE single image from Cloudinary
-app.delete("/api/cloudinary/delete/image", async (req, res) => {
+app.delete("/api/cloudinary/delete/image", verifyFirebaseToken, verifyAdmin, async (req, res) => {
   try {
     const { publicId } = req.body;
 
@@ -2565,7 +2708,7 @@ app.delete("/api/cloudinary/delete/image", async (req, res) => {
 });
 
 // DELETE single video from Cloudinary
-app.delete("/api/cloudinary/delete/video", async (req, res) => {
+app.delete("/api/cloudinary/delete/video", verifyFirebaseToken, verifyAdmin, async (req, res) => {
   try {
     const { publicId } = req.body;
 
@@ -2606,7 +2749,7 @@ app.delete("/api/cloudinary/delete/video", async (req, res) => {
 });
 
 // DELETE batch images
-app.post("/api/cloudinary/delete/batch", async (req, res) => {
+app.post("/api/cloudinary/delete/batch", verifyFirebaseToken, verifyAdmin, async (req, res) => {
   try {
     const { publicIds } = req.body;
 
@@ -2651,7 +2794,7 @@ app.post("/api/cloudinary/delete/batch", async (req, res) => {
 
     // GET user cart
 
-app.get("/api/cart/:userId", async (req, res) => {
+app.get("/api/cart/:userId", verifyFirebaseToken, verifyCartOwner, async (req, res) => {
   try {
     const userId = req.params.userId;
     const cart = await cartsCollection.findOne({ userId });
@@ -2671,7 +2814,7 @@ app.get("/api/cart/:userId", async (req, res) => {
 });
 
 // POST/UPDATE full cart
-app.post("/api/cart/:userId", async (req, res) => {
+app.post("/api/cart/:userId", verifyFirebaseToken, verifyCartOwner, async (req, res) => {
   try {
     const userId = req.params.userId;
     const items = req.body.items || [];
@@ -2714,7 +2857,7 @@ app.post("/api/cart/:userId", async (req, res) => {
 });
 
     // ADD single item
-    app.post("/api/cart/:userId/add", async (req, res) => {
+    app.post("/api/cart/:userId/add", verifyFirebaseToken, verifyCartOwner, async (req, res) => {
       try {
         const { userId } = req.params;
         const item = req.body;
@@ -2776,7 +2919,7 @@ app.post("/api/cart/:userId", async (req, res) => {
     });
 
     // UPDATE item quantity
-    app.patch("/api/cart/:userId/update/:itemKey", async (req, res) => {
+    app.patch("/api/cart/:userId/update/:itemKey", verifyFirebaseToken, verifyCartOwner, async (req, res) => {
       try {
         const { userId, itemKey } = req.params;
         const { qty } = req.body;
@@ -2836,7 +2979,7 @@ app.post("/api/cart/:userId", async (req, res) => {
     });
 
     // REMOVE item
-    app.delete("/api/cart/:userId/remove/:itemKey", async (req, res) => {
+    app.delete("/api/cart/:userId/remove/:itemKey", verifyFirebaseToken, verifyCartOwner, async (req, res) => {
       try {
         const { userId, itemKey } = req.params;
         
@@ -2868,7 +3011,7 @@ app.post("/api/cart/:userId", async (req, res) => {
     });
 
     // CLEAR cart
-    app.delete("/api/cart/:userId/clear", async (req, res) => {
+    app.delete("/api/cart/:userId/clear", verifyFirebaseToken, verifyCartOwner, async (req, res) => {
       try {
         const { userId } = req.params;
         
@@ -2895,7 +3038,7 @@ app.post("/api/cart/:userId", async (req, res) => {
     });
 
     // Get cart count
-    app.get("/api/cart/:userId/count", async (req, res) => {
+    app.get("/api/cart/:userId/count", verifyFirebaseToken, verifyCartOwner, async (req, res) => {
       try {
         const userId = req.params.userId;
         const cart = await cartsCollection.findOne({ userId });
@@ -4161,7 +4304,7 @@ app.post("/api/coupons/validate", async (req, res) => {
 });
 
 // POST - Increment coupon usage (called after successful order)
-app.post("/api/coupons/use/:code", async (req, res) => {
+app.post("/api/coupons/use/:code", verifyFirebaseToken, verifyAdmin, async (req, res) => {
   try {
     const { code } = req.params;
 
