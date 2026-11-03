@@ -194,82 +194,82 @@ const verifyToken = (req, res, next) => {
   });
 }
 
-// Firebase Token verification
-const verifyFirebaseToken = async (req, res, next) => {
-  try {
-    const authHeader = req?.headers?.authorization;
-    
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({ 
-        success: false,
-        message: "No token provided" 
-      });
-    }
+  // Firebase Token verification
+  const verifyFirebaseToken = async (req, res, next) => {
+    try {
+      const authHeader = req?.headers?.authorization;
+      
+      if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        return res.status(401).json({ 
+          success: false,
+          message: "No token provided" 
+        });
+      }
 
-    const token = authHeader.split(' ')[1];
-    
-    // Verify Firebase ID token
-    const decodedToken = await admin.auth().verifyIdToken(token);
-    
-    // Attach user info to request
-    req.uid = decodedToken.uid;
-    req.tokenEmail = decodedToken.email;
-    req.emailVerified = decodedToken.email_verified;
-    
-    next();
-  } catch (error) {
-    console.error('Token verification error:', error.code);
-    
-    if (error.code === 'auth/id-token-expired') {
+      const token = authHeader.split(' ')[1];
+      
+      // Verify Firebase ID token
+      const decodedToken = await admin.auth().verifyIdToken(token);
+      
+      // Attach user info to request
+      req.uid = decodedToken.uid;
+      req.tokenEmail = decodedToken.email;
+      req.emailVerified = decodedToken.email_verified;
+      
+      next();
+    } catch (error) {
+      console.error('Token verification error:', error.code);
+      
+      if (error.code === 'auth/id-token-expired') {
+        return res.status(401).json({
+          success: false,
+          message: 'Token expired. Please login again.'
+        });
+      }
+      
       return res.status(401).json({
         success: false,
-        message: 'Token expired. Please login again.'
+        message: 'Invalid token',
+        error: error.message
       });
     }
-    
-    return res.status(401).json({
-      success: false,
-      message: 'Invalid token',
-      error: error.message
-    });
-  }
-};
+  };
 
 
-// Admin verification
-const verifyAdmin = async (req, res, next) => {
-  try {
-    const email = req.tokenEmail;
-    
-    if (!email) {
-      return res.status(401).json({
+  // Admin verification
+  const verifyAdmin = async (req, res, next) => {
+    try {
+      const email = req.tokenEmail;
+      
+      if (!email) {
+        return res.status(401).json({
+          success: false,
+          message: 'Authentication required'
+        });
+      }
+
+      const user = await usersCollection.findOne({ 
+        email: email.toLowerCase() 
+      });
+
+      if (!user || user.role !== 'admin') {
+        return res.status(403).json({
+          success: false,
+          message: 'Admin access required'
+        });
+      }
+
+      req.user = user;
+      next();
+    } catch (error) {
+      console.error('Admin verification error:', error);
+      res.status(500).json({
         success: false,
-        message: 'Authentication required'
+        message: 'Error verifying admin access',
+        error: error.message
       });
     }
-
-    const user = await usersCollection.findOne({ 
-      email: email.toLowerCase() 
-    });
-
-    if (!user || user.role !== 'admin') {
-      return res.status(403).json({
-        success: false,
-        message: 'Admin access required'
-      });
-    }
-
-    req.user = user;
-    next();
-  } catch (error) {
-    console.error('Admin verification error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Error verifying admin access',
-      error: error.message
-    });
-  }
-};
+  };
 
 // Staff verification
 const verifyStaff = async (req, res, next) => {
@@ -2305,98 +2305,96 @@ app.get("/api/customers/export/csv", verifyFirebaseToken, verifyAdmin, async (re
 
 
     // POST - Create new product
-app.post("/api/products", verifyFirebaseToken, verifyAdmin, async (req, res) => {
-  try {
-    const productData = req.body;
+    app.post("/api/products", verifyFirebaseToken, verifyAdmin, async (req, res) => {
+      try {
+        const productData = req.body;
 
-    // Validate required fields
-    const requiredFields = ['sku', 'productName', 'newPrice', 'stock'];
-    for (const field of requiredFields) {
-      if (!productData[field]) {
-        return res.status(400).json({ 
+        // Validate required fields
+        const requiredFields = ['sku', 'productName', 'newPrice', 'stock'];
+        for (const field of requiredFields) {
+          if (!productData[field]) {
+            return res.status(400).json({ 
+              success: false,
+              message: `Missing required field: ${field}` 
+            });
+          }
+        }
+
+        // Validate images array
+        if (!productData.images || !Array.isArray(productData.images) || productData.images.length === 0) {
+          return res.status(400).json({ 
+            success: false,
+            message: "At least one product image is required" 
+          });
+        }
+
+        // Validate price values
+        if (productData.newPrice <= 0) {
+          return res.status(400).json({ 
+            success: false,
+            message: "Price must be greater than 0" 
+          });
+        }
+
+        if (productData.oldPrice && productData.oldPrice < productData.newPrice) {
+          return res.status(400).json({ 
+            success: false,
+            message: "Old price must be greater than new price" 
+          });
+        }
+
+        // Validate stock
+        if (productData.stock < 0) {
+          return res.status(400).json({ 
+            success: false,
+            message: "Stock cannot be negative" 
+          });
+        }
+
+        // Check if SKU already exists
+        const existingProduct = await productsCollection.findOne({ 
+          sku: productData.sku 
+        });
+        
+        if (existingProduct) {
+          return res.status(400).json({ 
+            success: false,
+            message: "Product with this SKU already exists" 
+          });
+        }
+
+        // Add timestamps
+        productData.createdAt = new Date();
+        productData.updatedAt = new Date();
+        
+        if (!productData.status) {
+          productData.status = 'active';
+        }
+
+        // Insert product
+        const result = await productsCollection.insertOne(productData);
+
+        res.status(201).json({
+          success: true,
+          message: "Product created successfully",
+          product: {
+            _id: result.insertedId,
+            ...productData
+          }
+        });
+
+      } catch (err) {
+        res.status(500).json({ 
           success: false,
-          message: `Missing required field: ${field}` 
+          message: "Error creating product", 
+          error: err.message 
         });
       }
-    }
-
-    // Validate images array
-    if (!productData.images || !Array.isArray(productData.images) || productData.images.length === 0) {
-      return res.status(400).json({ 
-        success: false,
-        message: "At least one product image is required" 
-      });
-    }
-
-    // Validate price values
-    if (productData.newPrice <= 0) {
-      return res.status(400).json({ 
-        success: false,
-        message: "Price must be greater than 0" 
-      });
-    }
-
-    if (productData.oldPrice && productData.oldPrice < productData.newPrice) {
-      return res.status(400).json({ 
-        success: false,
-        message: "Old price must be greater than new price" 
-      });
-    }
-
-    // Validate stock
-    if (productData.stock < 0) {
-      return res.status(400).json({ 
-        success: false,
-        message: "Stock cannot be negative" 
-      });
-    }
-
-    // Check if SKU already exists
-    const existingProduct = await productsCollection.findOne({ 
-      sku: productData.sku 
-    });
-    
-    if (existingProduct) {
-      return res.status(400).json({ 
-        success: false,
-        message: "Product with this SKU already exists" 
-      });
-    }
-
-    // Add timestamps
-    productData.createdAt = new Date();
-    productData.updatedAt = new Date();
-    
-    if (!productData.status) {
-      productData.status = 'active';
-    }
-
-    // Insert product
-    const result = await productsCollection.insertOne(productData);
-
-    res.status(201).json({
-      success: true,
-      message: "Product created successfully",
-      product: {
-        _id: result.insertedId,
-        ...productData
-      }
     });
 
-  } catch (err) {
-    res.status(500).json({ 
-      success: false,
-      message: "Error creating product", 
-      error: err.message 
-    });
-  }
-});
 
-
-// ============================================
-// PUT - Update product - FIXED VERSION
-// ============================================
-app.put("/api/products/:id", verifyFirebaseToken, verifyAdmin, async (req, res) => {
+    // PUT - Update product -
+    app.put("/api/products/:id", verifyFirebaseToken, verifyAdmin, async (req, res) => {
   try {
     const id = req.params.id;
     const updateData = req.body;
@@ -2445,11 +2443,11 @@ app.put("/api/products/:id", verifyFirebaseToken, verifyAdmin, async (req, res) 
       error: err.message 
     });
   }
-});
+    });
 
 
-// DELETE - Delete product with Cloudinary cleanup
-app.delete("/api/products/:id", verifyFirebaseToken, verifyAdmin, async (req, res) => {
+    // DELETE - Delete product with Cloudinary cleanup
+    app.delete("/api/products/:id", verifyFirebaseToken, verifyAdmin, async (req, res) => {
   try {
     const id = req.params.id;
 
@@ -2573,7 +2571,7 @@ app.delete("/api/products/:id", verifyFirebaseToken, verifyAdmin, async (req, re
       error: err.message 
     });
   }
-});
+    });
 
 
     // PATCH - Update product status
@@ -2627,12 +2625,12 @@ app.delete("/api/products/:id", verifyFirebaseToken, verifyAdmin, async (req, re
     });
 
 
-// ============================================
-// CLOUDINARY DELETE ROUTES (ADD THESE)
-// ============================================
+    // ============================================
+    // CLOUDINARY DELETE ROUTES (ADD THESE)
+    // ============================================
 
-// DELETE single image from Cloudinary
-app.delete("/api/cloudinary/delete/image", verifyFirebaseToken, verifyAdmin, async (req, res) => {
+    // DELETE single image from Cloudinary
+    app.delete("/api/cloudinary/delete/image", verifyFirebaseToken, verifyAdmin, async (req, res) => {
   try {
     const { publicId } = req.body;
 
@@ -2705,10 +2703,10 @@ app.delete("/api/cloudinary/delete/image", verifyFirebaseToken, verifyAdmin, asy
       }
     });
   }
-});
+    });
 
-// DELETE single video from Cloudinary
-app.delete("/api/cloudinary/delete/video", verifyFirebaseToken, verifyAdmin, async (req, res) => {
+    // DELETE single video from Cloudinary
+    app.delete("/api/cloudinary/delete/video", verifyFirebaseToken, verifyAdmin, async (req, res) => {
   try {
     const { publicId } = req.body;
 
@@ -2746,10 +2744,10 @@ app.delete("/api/cloudinary/delete/video", verifyFirebaseToken, verifyAdmin, asy
       error: err.message 
     });
   }
-});
+    });
 
-// DELETE batch images
-app.post("/api/cloudinary/delete/batch", verifyFirebaseToken, verifyAdmin, async (req, res) => {
+    // DELETE batch images
+    app.post("/api/cloudinary/delete/batch", verifyFirebaseToken, verifyAdmin, async (req, res) => {
   try {
     const { publicIds } = req.body;
 
@@ -2783,7 +2781,7 @@ app.post("/api/cloudinary/delete/batch", verifyFirebaseToken, verifyAdmin, async
       error: err.message 
     });
   }
-});
+    });
 
 
 
