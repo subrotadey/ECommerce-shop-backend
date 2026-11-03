@@ -142,6 +142,201 @@ cloudinary.config({
   api_secret: process.env.CLOUDINARY_API_SECRET
 });
 
+// ============================================
+// MEDIA HELPERS (Cloudinary + Product media)
+// ============================================
+
+const MAX_PRODUCT_VIDEOS = 3;
+
+// Video list normalize: legacy single object / array / null সব handle করে।
+// publicId ও url ছাড়া entry বাদ যায়, duplicate publicId বাদ যায়।
+function normalizeVideoList(input) {
+  const list = Array.isArray(input) ? input : input ? [input] : [];
+  const seen = new Set();
+  const result = [];
+
+  for (const video of list) {
+    if (!video || typeof video !== 'object') continue;
+    if (!video.publicId || !video.url) continue;
+    if (seen.has(video.publicId)) continue;
+
+    seen.add(video.publicId);
+    result.push({
+      url: video.url,
+      publicId: video.publicId,
+      thumbnailUrl: video.thumbnailUrl || '',
+      duration: video.duration ?? null,
+    });
+  }
+
+  return result;
+}
+
+// Request body-তে video সংক্রান্ত কোনো field আছে কি না।
+function hasVideoInput(data) {
+  return (
+    data.videos !== undefined ||
+    data.video !== undefined ||
+    data.media?.videos !== undefined ||
+    data.media?.video !== undefined
+  );
+}
+
+// Body থেকে videos[] বের করে নতুন structure বসায়:
+//   media.videos (canonical), media.video ও video (legacy mirror = প্রথম video)
+// Error হলে message string ফেরত দেয়, নাহলে null।
+function applyVideoStructure(data) {
+  if (!hasVideoInput(data)) return null;
+
+  const source =
+    data.media?.videos ?? data.media?.video ?? data.videos ?? data.video;
+
+  const videos = normalizeVideoList(source);
+
+  if (videos.length > MAX_PRODUCT_VIDEOS) {
+    return `Maximum ${MAX_PRODUCT_VIDEOS} videos allowed per product`;
+  }
+
+  data.videos = videos;
+  data.video = videos[0] || null;
+  data.media = {
+    ...(data.media || {}),
+    videos,
+    video: videos[0] || null,
+  };
+
+  return null;
+}
+
+// Product থেকে সব Cloudinary asset (image + video, legacy সহ) সংগ্রহ।
+function collectProductMedia(product) {
+  const assets = new Map();
+
+  const addAsset = (item, resourceType) => {
+    if (item?.publicId) {
+      assets.set(`${resourceType}:${item.publicId}`, {
+        publicId: item.publicId,
+        resourceType,
+      });
+    }
+  };
+
+  (Array.isArray(product.media?.images) ? product.media.images : []).forEach(
+    (img) => addAsset(img, 'image')
+  );
+  (Array.isArray(product.images) ? product.images : []).forEach((img) =>
+    addAsset(img, 'image')
+  );
+
+  (Array.isArray(product.media?.videos) ? product.media.videos : []).forEach(
+    (vid) => addAsset(vid, 'video')
+  );
+  addAsset(product.media?.video, 'video');
+  (Array.isArray(product.videos) ? product.videos : []).forEach((vid) =>
+    addAsset(vid, 'video')
+  );
+  addAsset(product.video, 'video');
+
+  return Array.from(assets.values());
+}
+
+// কোনো product এখনো এই publicId ব্যবহার করছে কি না।
+async function isCloudinaryAssetInUse(publicId) {
+  const product = await productsCollection.findOne(
+    {
+      $or: [
+        { 'media.images.publicId': publicId },
+        { 'media.videos.publicId': publicId },
+        { 'media.video.publicId': publicId },
+        { 'images.publicId': publicId },
+        { 'videos.publicId': publicId },
+        { 'video.publicId': publicId },
+      ],
+    },
+    { projection: { _id: 1 } }
+  );
+
+  return Boolean(product);
+}
+
+// DELETE /cloudinary/delete/image ও /video দুটোর shared handler।
+async function handleCloudinaryDelete(req, res, resourceType) {
+  try {
+    const { publicId } = req.body || {};
+
+    if (!publicId || typeof publicId !== 'string') {
+      return res.status(400).json({
+        success: false,
+        message: 'Public ID is required',
+      });
+    }
+
+    const config = cloudinary.config();
+    if (!config.cloud_name || !config.api_key || !config.api_secret) {
+      return res.status(500).json({
+        success: false,
+        message: 'Cloudinary configuration error',
+      });
+    }
+
+    // Safety guard: saved product এখনো ব্যবহার করলে delete করা যাবে না।
+    if (await isCloudinaryAssetInUse(publicId)) {
+      return res.status(409).json({
+        success: false,
+        inUse: true,
+        message: `This ${resourceType} is still used by a saved product and was not deleted`,
+      });
+    }
+
+    const result = await cloudinary.uploader.destroy(publicId, {
+      invalidate: true,
+      resource_type: resourceType,
+    });
+
+    if (result.result === 'ok') {
+      return res.json({
+        success: true,
+        status: 'deleted',
+        resourceType,
+        publicId,
+        message: `${resourceType} deleted successfully from Cloudinary`,
+        result,
+      });
+    }
+
+    if (result.result === 'not found') {
+      return res.json({
+        success: true,
+        status: 'not_found',
+        resourceType,
+        publicId,
+        message: `${resourceType} not found (may already be deleted)`,
+        result,
+      });
+    }
+
+    return res.status(502).json({
+      success: false,
+      status: 'failed',
+      resourceType,
+      publicId,
+      message: `Cloudinary could not delete the ${resourceType}`,
+      result,
+    });
+  } catch (err) {
+    console.error(`Cloudinary ${resourceType} delete error:`, {
+      message: err.message,
+      name: err.name,
+      http_code: err.http_code,
+    });
+
+    return res.status(500).json({
+      success: false,
+      message: err.message || `Error deleting ${resourceType} from Cloudinary`,
+    });
+  }
+}
+
 
 // ============================================
 // FIREBASE ADMIN INITIALIZATION
@@ -2304,7 +2499,7 @@ app.get("/api/customers/export/csv", verifyFirebaseToken, verifyAdmin, async (re
     });
 
 
-    // POST - Create new product
+        // POST - Create new product
     app.post("/api/products", verifyFirebaseToken, verifyAdmin, async (req, res) => {
       try {
         const productData = req.body;
@@ -2348,6 +2543,15 @@ app.get("/api/customers/export/csv", verifyFirebaseToken, verifyAdmin, async (re
           return res.status(400).json({ 
             success: false,
             message: "Stock cannot be negative" 
+          });
+        }
+
+        // Normalize videos (media.videos + legacy media.video / video mirror)
+        const videoError = applyVideoStructure(productData);
+        if (videoError) {
+          return res.status(400).json({
+            success: false,
+            message: videoError
           });
         }
 
@@ -2395,182 +2599,129 @@ app.get("/api/customers/export/csv", verifyFirebaseToken, verifyAdmin, async (re
 
     // PUT - Update product -
     app.put("/api/products/:id", verifyFirebaseToken, verifyAdmin, async (req, res) => {
-  try {
-    const id = req.params.id;
-    const updateData = req.body;
+      try {
+        const id = req.params.id;
+        const updateData = req.body;
 
-    console.log('📝 Updating product:', id);
-    console.log('📦 Update data:', JSON.stringify(updateData, null, 2));
+        // Remove _id if present
+        delete updateData._id;
 
-    // Remove _id if present
-    delete updateData._id;
-    
-    // Add updated timestamp
-    updateData.updatedAt = new Date();
+        // Normalize videos (media.videos + legacy media.video / video mirror)
+        const videoError = applyVideoStructure(updateData);
+        if (videoError) {
+          return res.status(400).json({
+            success: false,
+            message: videoError
+          });
+        }
 
-    // Update in database
-    const result = await productsCollection.updateOne(
-      { _id: new ObjectId(id) },
-      { $set: updateData }
-    );
+        // Add updated timestamp
+        updateData.updatedAt = new Date();
 
-    if (result.matchedCount === 0) {
-      console.log('❌ Product not found');
-      return res.status(404).json({ 
-        success: false,
-        message: "Product not found" 
-      });
-    }
+        const result = await productsCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: updateData }
+        );
 
-    console.log('✅ Product updated in database');
+        if (result.matchedCount === 0) {
+          return res.status(404).json({ 
+            success: false,
+            message: "Product not found" 
+          });
+        }
 
-    // Fetch updated product
-    const updatedProduct = await productsCollection.findOne({ 
-      _id: new ObjectId(id) 
-    });
+        const updatedProduct = await productsCollection.findOne({ 
+          _id: new ObjectId(id) 
+        });
 
-    res.json({
-      success: true,
-      message: "Product updated successfully",
-      product: updatedProduct
-    });
+        res.json({
+          success: true,
+          message: "Product updated successfully",
+          product: updatedProduct
+        });
 
-  } catch (err) {
-    console.error('❌ Update product error:', err);
-    res.status(500).json({ 
-      success: false,
-      message: "Error updating product", 
-      error: err.message 
-    });
-  }
+      } catch (err) {
+        console.error('Update product error:', err);
+        res.status(500).json({ 
+          success: false,
+          message: "Error updating product", 
+          error: err.message 
+        });
+      }
     });
 
 
     // DELETE - Delete product with Cloudinary cleanup
+        // DELETE - Delete product with Cloudinary cleanup (images + videos[] + legacy video)
     app.delete("/api/products/:id", verifyFirebaseToken, verifyAdmin, async (req, res) => {
-  try {
-    const id = req.params.id;
+      try {
+        const id = req.params.id;
 
-    console.log('🗑️ DELETE request for product:', id);
+        const product = await productsCollection.findOne({ 
+          _id: new ObjectId(id) 
+        });
 
-    // 1. First, get the product to access media publicIds
-    const product = await productsCollection.findOne({ 
-      _id: new ObjectId(id) 
-    });
-
-    if (!product) {
-      console.log('❌ Product not found');
-      return res.status(404).json({ 
-        success: false,
-        message: "Product not found" 
-      });
-    }
-
-    console.log('✅ Product found:', product.productName);
-
-    // 2. Collect all Cloudinary publicIds to delete
-    const publicIdsToDelete = [];
-    
-    // Images
-    if (product.media?.images && Array.isArray(product.media.images)) {
-      product.media.images.forEach(img => {
-        if (img.publicId) {
-          publicIdsToDelete.push(img.publicId);
+        if (!product) {
+          return res.status(404).json({ 
+            success: false,
+            message: "Product not found" 
+          });
         }
-      });
-    } else if (product.images && Array.isArray(product.images)) {
-      product.images.forEach(img => {
-        if (img.publicId) {
-          publicIdsToDelete.push(img.publicId);
+
+        // সব image ও video (legacy সহ), duplicate ছাড়া
+        const assetsToDelete = collectProductMedia(product);
+
+        // Delete from MongoDB first
+        const deleteResult = await productsCollection.deleteOne({ 
+          _id: new ObjectId(id) 
+        });
+
+        if (deleteResult.deletedCount === 0) {
+          return res.status(500).json({ 
+            success: false,
+            message: "Failed to delete product from database" 
+          });
         }
-      });
-    }
 
-    console.log('📸 Found', publicIdsToDelete.length, 'images to delete');
-
-    // Video
-    let videoPublicId = null;
-    if (product.media?.video?.publicId) {
-      videoPublicId = product.media.video.publicId;
-      console.log('🎬 Found video to delete:', videoPublicId);
-    } else if (product.video?.publicId) {
-      videoPublicId = product.video.publicId;
-      console.log('🎬 Found video to delete:', videoPublicId);
-    }
-
-    // 3. Delete from MongoDB first
-    console.log('💾 Deleting from database...');
-    const deleteResult = await productsCollection.deleteOne({ 
-      _id: new ObjectId(id) 
-    });
-
-    if (deleteResult.deletedCount === 0) {
-      console.log('❌ Failed to delete from database');
-      return res.status(500).json({ 
-        success: false,
-        message: "Failed to delete product from database" 
-      });
-    }
-
-    console.log('✅ Product deleted from database');
-
-    // 4. Delete images from Cloudinary (in background)
-    if (publicIdsToDelete.length > 0) {
-      console.log('🧹 Starting Cloudinary cleanup for images...');
-      
-      // Don't await this - let it run in background
-      Promise.all(
-        publicIdsToDelete.map(async (publicId) => {
-          try {
-            const result = await cloudinary.uploader.destroy(publicId, {
-              invalidate: true,
-              resource_type: 'image'
+        // Cloudinary cleanup (background, response আটকাবে না)
+        if (assetsToDelete.length > 0) {
+          Promise.allSettled(
+            assetsToDelete.map((asset) =>
+              cloudinary.uploader.destroy(asset.publicId, {
+                invalidate: true,
+                resource_type: asset.resourceType
+              })
+            )
+          ).then((results) => {
+            results.forEach((outcome, index) => {
+              const asset = assetsToDelete[index];
+              if (outcome.status === 'fulfilled') {
+                const status = outcome.value?.result;
+                if (status !== 'ok' && status !== 'not found') {
+                  console.error('Cloudinary cleanup unexpected result:', asset, status);
+                }
+              } else {
+                console.error('Cloudinary cleanup failed:', asset, outcome.reason?.message);
+              }
             });
-            console.log('✅ Deleted image:', publicId, result.result);
-            return result;
-          } catch (error) {
-            console.error('❌ Failed to delete image:', publicId, error.message);
-            return { error: error.message };
-          }
-        })
-      ).then(results => {
-        const successful = results.filter(r => r.result === 'ok' || r.result === 'not found').length;
-        console.log(`✅ Cloudinary cleanup complete: ${successful}/${publicIdsToDelete.length} images deleted`);
-      }).catch(error => {
-        console.error('❌ Cloudinary batch delete error:', error);
-      });
-    }
+          });
+        }
 
-    // 5. Delete video from Cloudinary (in background)
-    if (videoPublicId) {
-      console.log('🧹 Starting Cloudinary cleanup for video...');
-      
-      cloudinary.uploader.destroy(videoPublicId, {
-        invalidate: true,
-        resource_type: 'video'
-      }).then(result => {
-        console.log('✅ Deleted video:', videoPublicId, result.result);
-      }).catch(error => {
-        console.error('❌ Failed to delete video:', videoPublicId, error.message);
-      });
-    }
+        res.json({
+          success: true,
+          message: "Product deleted successfully",
+          deletedId: id,
+          mediaCleanupStarted: assetsToDelete.length
+        });
 
-    // 6. Return success immediately (don't wait for Cloudinary)
-    res.json({
-      success: true,
-      message: "Product deleted successfully",
-      deletedId: id,
-      mediaCleanupStarted: publicIdsToDelete.length + (videoPublicId ? 1 : 0)
-    });
-
-  } catch (err) {
-    console.error('❌ Delete product error:', err);
-    res.status(500).json({ 
-      success: false,
-      message: "Error deleting product", 
-      error: err.message 
-    });
-  }
+      } catch (err) {
+        console.error('Delete product error:', err);
+        res.status(500).json({ 
+          success: false,
+          message: "Error deleting product", 
+          error: err.message 
+        });
+      }
     });
 
 
@@ -2629,122 +2780,15 @@ app.get("/api/customers/export/csv", verifyFirebaseToken, verifyAdmin, async (re
     // CLOUDINARY DELETE ROUTES (ADD THESE)
     // ============================================
 
-    // DELETE single image from Cloudinary
-    app.delete("/api/cloudinary/delete/image", verifyFirebaseToken, verifyAdmin, async (req, res) => {
-  try {
-    const { publicId } = req.body;
-
-    if (!publicId) {
-      return res.status(400).json({ 
-        success: false,
-        message: "Public ID is required" 
-      });
-    }
-
-    // Verify Cloudinary config
-    const config = cloudinary.config();
-    console.log("Cloudinary Config Check:", {
-      cloudName: config.cloud_name,
-      apiKey: config.api_key,
-      hasApiSecret: !!config.api_secret,
-      secretLength: config.api_secret?.length
-    });
-
-    if (!config.cloud_name || !config.api_key || !config.api_secret) {
-      return res.status(500).json({
-        success: false,
-        message: "Cloudinary configuration error"
-      });
-    }
-    
-    // Delete from Cloudinary
-    const result = await cloudinary.uploader.destroy(publicId, {
-      invalidate: true,
-      resource_type: 'image'
-    });
-
-
-    // Handle different result statuses
-    if (result.result === 'ok') {
-      return res.json({ 
-        success: true,
-        message: "Image deleted successfully from Cloudinary",
-        result: result
-      });
-    } else if (result.result === 'not found') {
-      return res.json({ 
-        success: true,
-        message: "Image not found (may already be deleted)",
-        result: result
-      });
-    } else {
-      return res.status(500).json({ 
-        success: false,
-        message: "Failed to delete image",
-        result: result
-      });
-    }
-
-  } catch (err) {
-    console.error("Error details:", {
-      message: err.message,
-      name: err.name,
-      code: err.code,
-      http_code: err.http_code
-    });
-    
-    res.status(500).json({ 
-      success: false,
-      message: err.message || "Error deleting image from Cloudinary",
-      error: {
-        message: err.message,
-        name: err.name,
-        http_code: err.http_code
-      }
-    });
-  }
-    });
+        // DELETE single image from Cloudinary
+    app.delete("/api/cloudinary/delete/image", verifyFirebaseToken, verifyAdmin, (req, res) =>
+      handleCloudinaryDelete(req, res, 'image')
+    );
 
     // DELETE single video from Cloudinary
-    app.delete("/api/cloudinary/delete/video", verifyFirebaseToken, verifyAdmin, async (req, res) => {
-  try {
-    const { publicId } = req.body;
-
-
-    if (!publicId) {
-      return res.status(400).json({ 
-        success: false,
-        message: "Public ID is required" 
-      });
-    }
-
-    const result = await cloudinary.uploader.destroy(publicId, {
-      invalidate: true,
-      resource_type: 'video'
-    });
-
-    if (result.result === 'ok' || result.result === 'not found') {
-      return res.json({ 
-        success: true,
-        message: "Video deleted successfully",
-        result: result
-      });
-    } else {
-      return res.status(500).json({ 
-        success: false,
-        message: "Failed to delete video",
-        result: result
-      });
-    }
-
-  } catch (err) {
-    res.status(500).json({ 
-      success: false,
-      message: "Error deleting video from Cloudinary",
-      error: err.message 
-    });
-  }
-    });
+    app.delete("/api/cloudinary/delete/video", verifyFirebaseToken, verifyAdmin, (req, res) =>
+      handleCloudinaryDelete(req, res, 'video')
+    );
 
     // DELETE batch images
     app.post("/api/cloudinary/delete/batch", verifyFirebaseToken, verifyAdmin, async (req, res) => {
