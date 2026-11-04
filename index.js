@@ -5164,7 +5164,7 @@ app.post("/api/addresses", verifyFirebaseToken, async (req, res) => {
     } = req.body;
 
     // Basic required field check (mirrors validateAddress on frontend)
-    if (!fullName || !phone || !street || !city || !state || !zipCode || !country) {
+      if (!fullName || !phone || !street || !city || !state || !country) {
       return res.status(400).json({
         success: false,
         message: 'Missing required address fields',
