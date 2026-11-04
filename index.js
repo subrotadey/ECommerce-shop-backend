@@ -337,6 +337,312 @@ async function handleCloudinaryDelete(req, res, resourceType) {
   }
 }
 
+// ============================================
+// PRODUCT VALIDATION HELPERS
+// ============================================
+
+const SIZE_CHART = [
+  { size: 'S', length: 52 },
+  { size: 'M', length: 54 },
+  { size: 'L', length: 56 },
+  { size: 'XL', length: 58 },
+  { size: 'XXL', length: 60 },
+  { size: '3XL', length: 62 },
+];
+const KNOWN_SIZES = SIZE_CHART.map((s) => s.size);
+const PRODUCT_CATEGORIES = ['abaya', 'hijab'];
+const PRODUCT_STATUSES = ['active', 'draft', 'archived'];
+const MAX_PRODUCT_IMAGES = 10;
+const MAX_INVENTORY_COLORS = 100;
+const MAX_STOCK_PER_CELL = 1000000;
+
+const escapeRegex = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const cleanString = (value) => (typeof value === 'string' ? value.trim() : '');
+
+const generateSlug = (name, fallback) => {
+  const slug = String(name || '')
+    .toLowerCase()
+    .replace(/[^\w\s-]/g, '')
+    .replace(/\s+/g, '-')
+    .replace(/-+/g, '-')
+    .trim();
+  return slug || String(fallback || '').toLowerCase();
+};
+
+// Tags / categories: trim, খালি বাদ, case-insensitive duplicate বাদ।
+function normalizeStringList(input, label, errors, maxItems = 50, maxLength = 60) {
+  if (input === undefined || input === null) return [];
+  if (!Array.isArray(input)) {
+    errors.push(`${label} must be a list`);
+    return [];
+  }
+
+  const seen = new Set();
+  const result = [];
+
+  for (const raw of input) {
+    if (typeof raw !== 'string') {
+      errors.push(`${label} contains an invalid entry`);
+      continue;
+    }
+    const value = raw.trim();
+    if (!value) continue;
+    if (value.length > maxLength) {
+      errors.push(`${label} entry "${value.slice(0, 20)}..." is too long`);
+      continue;
+    }
+    const key = value.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(value);
+  }
+
+  if (result.length > maxItems) errors.push(`Maximum ${maxItems} ${label} allowed`);
+  return result;
+}
+
+// inventory: [{ color, sizes: [{ size, stock }] }]
+// প্রতিটি color-এ সবসময় ৬টি official size থাকে। না এলে stock = 0।
+function normalizeInventory(input, errors) {
+  if (input === undefined || input === null) return [];
+  if (!Array.isArray(input)) {
+    errors.push('Inventory must be a list of colors');
+    return [];
+  }
+  if (input.length > MAX_INVENTORY_COLORS) {
+    errors.push(`Maximum ${MAX_INVENTORY_COLORS} colors allowed`);
+    return [];
+  }
+
+  const seen = new Set();
+  const result = [];
+
+  for (const entry of input) {
+    const color = cleanString(entry?.color);
+
+    if (!color) {
+      errors.push('Every inventory row needs a color name');
+      continue;
+    }
+    if (color.length > 50) {
+      errors.push(`Color name "${color.slice(0, 20)}..." is too long`);
+      continue;
+    }
+
+    const key = color.toLowerCase();
+    if (seen.has(key)) {
+      errors.push(`Duplicate color: ${color}`);
+      continue;
+    }
+    seen.add(key);
+
+    const given = Array.isArray(entry.sizes) ? entry.sizes : [];
+
+    for (const row of given) {
+      if (!KNOWN_SIZES.includes(row?.size)) {
+        errors.push(`Unknown size "${row?.size}" for color ${color}`);
+      }
+    }
+
+    const sizes = SIZE_CHART.map(({ size }) => {
+      const row = given.find((r) => r?.size === size);
+      const raw = row?.stock;
+
+      if (raw === undefined || raw === null || raw === '') {
+        return { size, stock: 0 };
+      }
+
+      const stock = typeof raw === 'number' || typeof raw === 'string' ? Number(raw) : NaN;
+
+      if (!Number.isInteger(stock) || stock < 0 || stock > MAX_STOCK_PER_CELL) {
+        errors.push(`Stock for ${color} / ${size} must be a whole number of 0 or more`);
+        return { size, stock: 0 };
+      }
+
+      return { size, stock };
+    });
+
+    result.push({ color, sizes });
+  }
+
+  return result;
+}
+
+// Client-এর stock/sizes/colors বিশ্বাস না করে inventory থেকে হিসাব।
+// sizes/colors: শুধু যেগুলোর কোথাও stock > 0 (Storefront selector-এর জন্য)।
+function deriveFromInventory(inventory) {
+  let stock = 0;
+  const sellableColors = [];
+  const sellableSizes = new Set();
+
+  for (const { color, sizes } of inventory) {
+    const colorTotal = sizes.reduce((sum, s) => sum + s.stock, 0);
+    stock += colorTotal;
+
+    if (colorTotal > 0) {
+      sellableColors.push(color);
+      sizes.forEach((s) => s.stock > 0 && sellableSizes.add(s.size));
+    }
+  }
+
+  return {
+    stock,
+    colors: sellableColors,
+    sizes: KNOWN_SIZES.filter((size) => sellableSizes.has(size)),
+  };
+}
+
+function normalizeImageList(input, errors) {
+  const list = Array.isArray(input) ? input : [];
+  const seen = new Set();
+  const result = [];
+
+  for (const image of list) {
+    if (!image || typeof image !== 'object' || !image.url || !image.publicId) {
+      errors.push('Every image needs a url and publicId');
+      continue;
+    }
+    if (seen.has(image.publicId)) continue;
+    seen.add(image.publicId);
+
+    result.push({
+      url: image.url,
+      publicId: image.publicId,
+      thumbnailUrl: image.thumbnailUrl || image.url,
+      isMain: image.isMain === true,
+    });
+  }
+
+  if (result.length > MAX_PRODUCT_IMAGES) {
+    errors.push(`Maximum ${MAX_PRODUCT_IMAGES} images allowed`);
+  }
+
+  let mainIndex = result.findIndex((image) => image.isMain);
+  if (mainIndex === -1 && result.length > 0) mainIndex = 0;
+
+  return result.map((image, index) => ({
+    ...image,
+    isMain: index === mainIndex,
+    order: index,
+  }));
+}
+
+// Create ও Update দুটোর জন্য একই validation। শুধু whitelist করা field ফেরত দেয়।
+// existing থাকলে (Update) না-পাঠানো field আগের মান থেকে নেয়।
+function buildProductDocument(body, existing = null) {
+  const errors = [];
+  const pick = (key) => (body[key] !== undefined ? body[key] : existing?.[key]);
+
+  // Basic
+  const sku = cleanString(pick('sku'));
+  const productName = cleanString(pick('productName'));
+  const mainCategory = cleanString(pick('mainCategory')).toLowerCase();
+  const status = cleanString(pick('status')) || 'active';
+
+  if (!sku) errors.push('SKU is required');
+  else if (sku.length > 60) errors.push('SKU is too long');
+
+  if (!productName) errors.push('Product name is required');
+  else if (productName.length > 200) errors.push('Product name is too long');
+
+  if (!PRODUCT_CATEGORIES.includes(mainCategory)) {
+    errors.push('Main category must be Abaya or Hijab');
+  }
+  if (!PRODUCT_STATUSES.includes(status)) {
+    errors.push('Invalid product status');
+  }
+
+  // Pricing
+  const newPrice = Number(pick('newPrice'));
+  if (!Number.isFinite(newPrice) || newPrice <= 0) {
+    errors.push('Wholesale price must be a number greater than 0');
+  }
+
+  let oldPrice = null;
+  const rawOld = pick('oldPrice');
+  if (rawOld !== undefined && rawOld !== null && rawOld !== '' && Number(rawOld) !== 0) {
+    oldPrice = Number(rawOld);
+    if (!Number.isFinite(oldPrice) || oldPrice < 0) {
+      errors.push('Compare-at price must be a valid number');
+    } else if (Number.isFinite(newPrice) && oldPrice < newPrice) {
+      errors.push('Compare-at price must not be lower than the wholesale price');
+    }
+  }
+
+  // Inventory (stock এখানেই নির্ধারিত হয়)
+  const inventory = normalizeInventory(pick('inventory'), errors);
+  const { stock, colors, sizes } = deriveFromInventory(inventory);
+
+  // Media
+  const imageSource =
+    body.media?.images ?? body.images ?? existing?.media?.images ?? existing?.images;
+  const images = normalizeImageList(imageSource, errors);
+
+  const videoSource = hasVideoInput(body)
+    ? body.media?.videos ?? body.videos ?? body.media?.video ?? body.video
+    : existing?.media?.videos ?? existing?.videos ?? existing?.media?.video ?? existing?.video;
+  const videos = normalizeVideoList(videoSource);
+  if (videos.length > MAX_PRODUCT_VIDEOS) {
+    errors.push(`Maximum ${MAX_PRODUCT_VIDEOS} videos allowed per product`);
+  }
+
+  // Description
+  const rawDescription = pick('descriptionHtml');
+  const descriptionHtml = typeof rawDescription === 'string' ? rawDescription : '';
+  if (descriptionHtml.length > 100000) errors.push('Description is too long');
+
+  // Additional info
+  const info = pick('additionalInfo') || {};
+  const additionalInfo = {
+    fabric: cleanString(info.fabric),
+    workType: cleanString(info.workType),
+    washCare: cleanString(info.washCare),
+    countryOfOrigin: cleanString(info.countryOfOrigin) || 'UAE',
+    hijabIncluded: info.hijabIncluded === true,
+  };
+  if (additionalInfo.washCare.length > 1000) errors.push('Wash & care text is too long');
+  if (additionalInfo.fabric.length > 100 || additionalInfo.workType.length > 100) {
+    errors.push('Fabric / work type text is too long');
+  }
+
+  const categories = normalizeStringList(pick('categories'), 'Categories', errors);
+  const tags = normalizeStringList(pick('tags'), 'Tags', errors);
+
+  // Active product-এর জন্য কঠোর নিয়ম। Draft অসম্পূর্ণ থাকতে পারে।
+  if (status === 'active') {
+    if (images.length < 1) errors.push('At least one product image is required');
+    if (inventory.length < 1) errors.push('Add at least one color with stock quantities');
+    if (descriptionHtml.replace(/<[^>]*>/g, '').trim().length < 50) {
+      errors.push('Description must be at least 50 characters');
+    }
+  }
+
+  return {
+    errors,
+    doc: {
+      sku,
+      productName,
+      slug: generateSlug(productName, sku),
+      status,
+      mainCategory,
+      newPrice,
+      oldPrice,
+      stock,
+      sizes,
+      colors,
+      inventory,
+      categories,
+      tags,
+      descriptionHtml,
+      additionalInfo,
+      images,
+      videos,
+      video: videos[0] || null,
+      media: { images, videos, video: videos[0] || null },
+    },
+  };
+}
+
 
 // ============================================
 // FIREBASE ADMIN INITIALIZATION
@@ -534,6 +840,59 @@ const verifyCartOwner = (req, res, next) => {
   next();
 };
 
+// ============================================
+// WHOLESALE RULES (business rules: স্থির, Admin Settings থেকে বদলায় না)
+// ============================================
+const MOQ_PER_COLOR = 12;            // প্রতি Product + Color ন্যূনতম
+const BULK_DISCOUNT_THRESHOLD = 100; // পুরো অর্ডারের মোট qty
+const BULK_DISCOUNT_PERCENT = 5;
+const ORDER_CURRENCY = 'AED';
+const ALLOW_COUPON_WITH_BULK = true; // false করলে bulk ছাড় পেলে coupon কাজ করবে না
+
+const round2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
+
+// প্রতিটি Product + Color গ্রুপ আলাদাভাবে ≥ MOQ কি না। size মিশানো চলবে।
+function validateMoq(pricedItems) {
+  const groups = new Map();
+
+  for (const item of pricedItems) {
+    const key = `${item.productId}|${String(item.color ?? '').toLowerCase()}`;
+    const group = groups.get(key) || { name: item.name, color: item.color, qty: 0 };
+    group.qty += item.qty;
+    groups.set(key, group);
+  }
+
+  const short = [...groups.values()].filter((g) => g.qty < MOQ_PER_COLOR);
+
+  if (short.length > 0) {
+    const detail = short
+      .map((g) => `${g.name}${g.color ? ` (${g.color})` : ''}: ${g.qty}/${MOQ_PER_COLOR}`)
+      .join(', ');
+    const err = new Error(
+      `Minimum ${MOQ_PER_COLOR} pieces required for each product and color. ${detail}`
+    );
+    err.status = 400;
+    throw err;
+  }
+}
+
+function hasInventory(product) {
+  return Array.isArray(product?.inventory) && product.inventory.length > 0;
+}
+
+// color case-insensitive মেলায়, সঠিক (saved) color নাম ফেরত দেয়
+function findInventoryCell(product, color, size) {
+  if (!hasInventory(product)) return null;
+  const wanted = cleanString(color).toLowerCase();
+  const row = product.inventory.find(
+    (r) => String(r.color).toLowerCase() === wanted
+  );
+  if (!row) return null;
+  const cell = (row.sizes || []).find((s) => s.size === size);
+  if (!cell) return null;
+  return { color: row.color, size: cell.size, stock: cell.stock };
+}
+
 async function priceCartItems(rawItems) {
   if (!Array.isArray(rawItems) || rawItems.length === 0) {
     const err = new Error('Cart is empty');
@@ -542,9 +901,11 @@ async function priceCartItems(rawItems) {
   }
 
   const priced = [];
+  const demand = new Map(); // একই product+color+size একাধিক line হলে মোট চাহিদা
+
   for (const item of rawItems) {
     const qty = Number(item.qty);
-    if (!item.productId || !qty || qty < 1) {
+    if (!item.productId || !Number.isInteger(qty) || qty < 1) {
       const err = new Error('Invalid cart item');
       err.status = 400;
       throw err;
@@ -565,7 +926,36 @@ async function priceCartItems(rawItems) {
       throw err;
     }
 
-    if ((product.stock ?? 0) < qty) {
+    let color = item.color ?? null;
+    let size = item.size ?? null;
+
+    if (hasInventory(product)) {
+      // Variant-wise: color + size বাধ্যতামূলক, ওই cell-এর stock চেক
+      const cell = findInventoryCell(product, item.color, item.size);
+      if (!cell) {
+        const err = new Error(
+          `Selected color/size is not available for ${product.productName}`
+        );
+        err.status = 400;
+        throw err;
+      }
+
+      const demandKey = `${item.productId}|${cell.color}|${cell.size}`;
+      const wanted = (demand.get(demandKey) || 0) + qty;
+      demand.set(demandKey, wanted);
+
+      if (cell.stock < wanted) {
+        const err = new Error(
+          `Insufficient stock for ${product.productName} (${cell.color} / ${cell.size})`
+        );
+        err.status = 400;
+        throw err;
+      }
+
+      color = cell.color;
+      size = cell.size;
+    } else if ((product.stock ?? 0) < qty) {
+      // পুরোনো product (inventory নেই): আগের global stock চেক
       const err = new Error(`Insufficient stock for ${product.productName}`);
       err.status = 400;
       throw err;
@@ -579,8 +969,8 @@ async function priceCartItems(rawItems) {
       price: Number(product.newPrice),
       oldPrice: product.oldPrice,
       image: item.image || product.images?.[0] || '',
-      size: item.size ?? null,
-      color: item.color ?? null,
+      size,
+      color,
       qty
     });
   }
@@ -588,22 +978,47 @@ async function priceCartItems(rawItems) {
 }
 
 function computeOrderTotals(pricedItems, couponDoc) {
-  const subtotal = pricedItems.reduce((sum, item) => sum + (item.price * item.qty), 0);
-  let discount = 0;
-  if (couponDoc) {
+  const totalQuantity = pricedItems.reduce((sum, item) => sum + item.qty, 0);
+  const subtotal = round2(
+    pricedItems.reduce((sum, item) => sum + item.price * item.qty, 0)
+  );
+
+  // Bulk discount: মোট qty ≥ 100 হলে ৫%, শুধু merchandise subtotal-এ
+  const bulkDiscountPercent =
+    totalQuantity >= BULK_DISCOUNT_THRESHOLD ? BULK_DISCOUNT_PERCENT : 0;
+  const bulkDiscount = round2((subtotal * bulkDiscountPercent) / 100);
+
+  // Coupon: bulk ছাড়ের পরের অংশে। free_shipping coupon-এ এখন ছাড় নেই (delivery মোটে যোগ হয় না)
+  let couponDiscount = 0;
+  if (couponDoc && (ALLOW_COUPON_WITH_BULK || bulkDiscount === 0)) {
+    const base = subtotal - bulkDiscount;
+
     if (couponDoc.type === 'percentage') {
-      discount = (subtotal * (couponDoc.value || 0)) / 100;
-      if (couponDoc.maxDiscount && discount > couponDoc.maxDiscount) {
-        discount = couponDoc.maxDiscount;
+      couponDiscount = (base * (couponDoc.value || 0)) / 100;
+      if (couponDoc.maxDiscount && couponDiscount > couponDoc.maxDiscount) {
+        couponDiscount = couponDoc.maxDiscount;
       }
     } else if (couponDoc.type === 'fixed') {
-      discount = Math.min(couponDoc.value || 0, subtotal);
+      couponDiscount = Math.min(couponDoc.value || 0, base);
     }
   }
-  const tax = (subtotal - discount) * 0.05;
-  const shipping = couponDoc?.type === 'free_shipping' || subtotal > 1000 ? 0 : 100;
-  const total = subtotal - discount + tax + shipping;
-  return { subtotal, discount, tax, shipping, total };
+  couponDiscount = round2(couponDiscount);
+
+  const discount = round2(bulkDiscount + couponDiscount);
+  const total = round2(subtotal - discount);
+
+  return {
+    currency: ORDER_CURRENCY,
+    totalQuantity,
+    subtotal,
+    bulkDiscountPercent,
+    bulkDiscount,
+    couponDiscount,
+    discount,
+    tax: 0,
+    shipping: 0,
+    total
+  };
 }
 
 async function loadValidCoupon(code, subtotal) {
@@ -642,21 +1057,239 @@ async function loadValidCoupon(code, subtotal) {
   return coupon;
 }
 
+// Variant cell + global stock + soldCount একই atomic update-এ কমে।
+// মাঝপথে কোনো item ব্যর্থ হলে আগের item-গুলোর stock ফেরত যায়।
 async function decrementStock(items) {
-  for (const item of items) {
-    const result = await productsCollection.updateOne(
-      { _id: new ObjectId(item.productId), stock: { $gte: item.qty } },
-      {
-        $inc: { stock: -item.qty, soldCount: item.qty },
-        $set: { updatedAt: new Date() }
+  const done = [];
+
+  try {
+    for (const item of items) {
+      const qty = Number(item.qty);
+
+      const product = await productsCollection.findOne(
+        { _id: new ObjectId(item.productId) },
+        { projection: { inventory: 1, productName: 1 } }
+      );
+
+      if (!product) {
+        const err = new Error(`Product not found: ${item.name}`);
+        err.status = 400;
+        throw err;
       }
-    );
-    if (result.modifiedCount === 0) {
-      const err = new Error(`Insufficient stock for ${item.name}`);
-      err.status = 400;
-      throw err;
+
+      let result;
+
+      if (hasInventory(product)) {
+        const cell = findInventoryCell(product, item.color, item.size);
+        if (!cell) {
+          const err = new Error(`Color/size not available for ${item.name}`);
+          err.status = 400;
+          throw err;
+        }
+
+        result = await productsCollection.updateOne(
+          {
+            _id: product._id,
+            inventory: {
+              $elemMatch: {
+                color: cell.color,
+                sizes: { $elemMatch: { size: cell.size, stock: { $gte: qty } } }
+              }
+            }
+          },
+          {
+            $inc: {
+              'inventory.$[c].sizes.$[s].stock': -qty,
+              stock: -qty,
+              soldCount: qty
+            },
+            $set: { updatedAt: new Date() }
+          },
+          { arrayFilters: [{ 'c.color': cell.color }, { 's.size': cell.size }] }
+        );
+      } else {
+        result = await productsCollection.updateOne(
+          { _id: product._id, stock: { $gte: qty } },
+          {
+            $inc: { stock: -qty, soldCount: qty },
+            $set: { updatedAt: new Date() }
+          }
+        );
+      }
+
+      if (result.modifiedCount === 0) {
+        const err = new Error(`Insufficient stock for ${item.name}`);
+        err.status = 400;
+        throw err;
+      }
+
+      done.push(item);
+    }
+  } catch (err) {
+    await restoreStock(done);
+    throw err;
+  }
+}
+
+// Stock ফেরত (refund / rollback)। কোনো item ব্যর্থ হলে থামে না, ব্যর্থ item-এর তালিকা ফেরত দেয়।
+async function restoreStock(items) {
+  const failed = [];
+
+  for (const item of items || []) {
+    try {
+      const qty = Number(item.qty);
+
+      const product = await productsCollection.findOne(
+        { _id: new ObjectId(item.productId) },
+        { projection: { inventory: 1 } }
+      );
+
+      if (!product) {
+        failed.push(item);
+        continue;
+      }
+
+      let result;
+
+      if (hasInventory(product)) {
+        const cell = findInventoryCell(product, item.color, item.size);
+        if (!cell) {
+          failed.push(item);
+          continue;
+        }
+
+        result = await productsCollection.updateOne(
+          { _id: product._id },
+          {
+            $inc: {
+              'inventory.$[c].sizes.$[s].stock': qty,
+              stock: qty,
+              soldCount: -qty
+            },
+            $set: { updatedAt: new Date() }
+          },
+          { arrayFilters: [{ 'c.color': cell.color }, { 's.size': cell.size }] }
+        );
+      } else {
+        result = await productsCollection.updateOne(
+          { _id: product._id },
+          {
+            $inc: { stock: qty, soldCount: -qty },
+            $set: { updatedAt: new Date() }
+          }
+        );
+      }
+
+      if (result.matchedCount === 0) failed.push(item);
+    } catch (restoreErr) {
+      console.error('Stock restore error:', item.productId, restoreErr.message);
+      failed.push(item);
     }
   }
+
+  if (failed.length > 0) {
+    console.error('Stock restore failed for items:', failed.map((i) => i.productId));
+  }
+
+  return failed;
+}
+
+async function releaseCouponUsage(code) {
+  if (!code) return;
+  await couponsCollection.updateOne(
+    { code: String(code).toUpperCase(), usage: { $gt: 0 } },
+    { $inc: { usage: -1 }, $set: { updatedAt: new Date() } }
+  );
+}
+
+// অপরিশোধিত অর্ডার cancel (customer ও admin দুজনের জন্য shared)।
+// ownerEmail দিলে অর্ডারটি ওই customer-এর কি না যাচাই হয়।
+async function cancelUnpaidOrder(orderId, { by, reason, allowedStatuses, ownerEmail }) {
+  const order = await ordersCollection.findOne({ orderId });
+
+  if (!order) {
+    const err = new Error('Order not found');
+    err.status = 404;
+    throw err;
+  }
+
+  if (ownerEmail && String(order.customer?.email || '').toLowerCase() !== String(ownerEmail).toLowerCase()) {
+    const err = new Error('You can only cancel your own order');
+    err.status = 403;
+    throw err;
+  }
+
+  if (order.payment?.status === 'paid') {
+    const err = new Error('This order is already paid. Please request a refund instead.');
+    err.status = 400;
+    throw err;
+  }
+
+  if (order.payment?.status !== 'pending' || !allowedStatuses.includes(order.status)) {
+    const err = new Error(`Order cannot be cancelled in its current state (${order.status})`);
+    err.status = 400;
+    throw err;
+  }
+
+  const isStripe = order.payment?.method === 'stripe';
+
+  // Stripe: checkout session বন্ধ করি, যাতে cancel-এর পরে কেউ পেমেন্ট করতে না পারে।
+  // বন্ধ না হলে আর session paid কি না দেখি; paid হলে cancel হবে না।
+  if (isStripe && order.payment?.stripeSessionId) {
+    try {
+      await stripe.checkout.sessions.expire(order.payment.stripeSessionId);
+    } catch (expireErr) {
+      try {
+        const session = await stripe.checkout.sessions.retrieve(order.payment.stripeSessionId);
+        if (session?.payment_status === 'paid') {
+          const err = new Error('Payment was just received for this order. It cannot be cancelled.');
+          err.status = 409;
+          throw err;
+        }
+      } catch (checkErr) {
+        if (checkErr.status === 409) throw checkErr;
+        console.error('Stripe session check failed:', checkErr.message);
+      }
+    }
+  }
+
+  // Atomic: শুধু এখনো pending থাকলেই cancelled হবে (double cancel / race আটকায়)
+  const claim = await ordersCollection.findOneAndUpdate(
+    { orderId, status: { $in: allowedStatuses }, 'payment.status': 'pending' },
+    {
+      $set: {
+        status: 'cancelled',
+        'payment.status': 'cancelled',
+        cancelledAt: new Date(),
+        cancelledBy: by,
+        cancelReason: reason,
+        updatedAt: new Date()
+      }
+    },
+    { returnDocument: 'after' }
+  );
+
+  const cancelled = unwrapFindOneAndUpdate(claim);
+
+  if (!cancelled) {
+    const err = new Error('Order state changed. Please refresh and try again.');
+    err.status = 409;
+    throw err;
+  }
+
+  // Offline (COD / bank deposit): অর্ডারের সময়ই stock ও coupon কমেছিল, তাই ফেরত
+  if (!isStripe) {
+    const failed = await restoreStock(cancelled.items);
+    if (failed.length > 0) {
+      await ordersCollection.updateOne(
+        { orderId },
+        { $set: { stockRestoreIssue: true, updatedAt: new Date() } }
+      );
+    }
+    await releaseCouponUsage(cancelled.coupon?.code);
+  }
+
+  return cancelled;
 }
 
 async function bumpCouponUsage(code) {
@@ -670,10 +1303,17 @@ async function bumpCouponUsage(code) {
 async function createOfflineOrder({ req, paymentMethod, items, couponCode, shippingAddress }) {
   const customerEmail = (req.tokenEmail || '').toLowerCase();
   const userId = customerEmail;
+
   const pricedItems = await priceCartItems(items);
+  validateMoq(pricedItems);
+
   const subtotal = pricedItems.reduce((sum, item) => sum + (item.price * item.qty), 0);
   const couponDoc = await loadValidCoupon(couponCode, subtotal);
   const pricing = computeOrderTotals(pricedItems, couponDoc);
+
+  // coupon থেকে সত্যিই ছাড় না পেলে (যেমন free_shipping) coupon সংরক্ষণ বা usage গণনা নয়
+  const appliedCoupon = couponDoc && pricing.couponDiscount > 0 ? couponDoc : null;
+
   const user = await usersCollection.findOne({ email: customerEmail });
   const orderId = `ORD-${Date.now()}-${Math.random().toString(36).substr(2, 9).toUpperCase()}`;
 
@@ -687,6 +1327,7 @@ async function createOfflineOrder({ req, paymentMethod, items, couponCode, shipp
       address: shippingAddress || user?.address || {}
     },
     items: pricedItems,
+    currency: ORDER_CURRENCY,
     pricing,
     payment: {
       method: paymentMethod,
@@ -697,22 +1338,29 @@ async function createOfflineOrder({ req, paymentMethod, items, couponCode, shipp
     updatedAt: new Date()
   };
 
-  if (couponDoc) {
+  if (appliedCoupon) {
     orderData.coupon = {
-      code: couponDoc.code,
-      type: couponDoc.type,
-      value: couponDoc.value || 0,
-      discount: pricing.discount
+      code: appliedCoupon.code,
+      type: appliedCoupon.type,
+      value: appliedCoupon.value || 0,
+      discount: pricing.couponDiscount
     };
   }
 
   await decrementStock(pricedItems);
-  await ordersCollection.insertOne(orderData);
+
+  try {
+    await ordersCollection.insertOne(orderData);
+  } catch (insertErr) {
+    await restoreStock(pricedItems);
+    throw insertErr;
+  }
+
   await cartsCollection.updateOne(
     { userId },
     { $set: { items: [], updatedAt: new Date() } }
   );
-  await bumpCouponUsage(couponDoc?.code);
+  await bumpCouponUsage(appliedCoupon?.code);
 
   return orderData;
 }
@@ -748,7 +1396,15 @@ async function fulfillPaidOrder(orderId, extraPaymentFields = {}) {
   }
 
   if (order.items?.length) {
-    await decrementStock(order.items);
+    try {
+      await decrementStock(order.items);
+    } catch (stockErr) {
+      console.error('Stock decrement failed after payment:', orderId, stockErr.message);
+      await ordersCollection.updateOne(
+        { orderId },
+        { $set: { stockIssue: stockErr.message, updatedAt: new Date() } }
+      );
+    }
   }
 
   await bumpCouponUsage(order.coupon?.code);
@@ -990,6 +1646,16 @@ async function run() {
     addressesCollection = database.collection("addresses");
 
     console.log("All collections initialized");
+
+        // SKU database level-এও unique (দুটো request একসঙ্গে এলে race আটকায়)
+    try {
+      await productsCollection.createIndex(
+        { sku: 1 },
+        { unique: true, name: 'sku_unique' }
+      );
+    } catch (indexError) {
+      console.error('SKU index creation failed:', indexError.message);
+    }
 
     // ============================================
     // JWT VERIFICATION MIDDLEWARE
@@ -2460,11 +3126,12 @@ app.get("/api/customers/export/csv", verifyFirebaseToken, verifyAdmin, async (re
     // ============================================
     // PRODUCTS ROUTES
     // ============================================
-    app.get("/products", async (req, res) => {
+        app.get("/products", async (req, res) => {
       try {
         const { category, minPrice, maxPrice, size, color, tag } = req.query;
 
-        let query = {};
+        // Draft ও archived Storefront-এ দেখানো হয় না
+        let query = { status: { $nin: ['draft', 'archived'] } };
 
         if (category) query.mainCategory = category;
         if (size) query.sizes = size;
@@ -2482,11 +3149,31 @@ app.get("/api/customers/export/csv", verifyFirebaseToken, verifyAdmin, async (re
       }
     });
 
+    // Admin: সব product (draft সহ)
+    app.get("/api/admin/products", verifyFirebaseToken, verifyAdmin, async (req, res) => {
+      try {
+        const products = await productsCollection
+          .find({})
+          .sort({ createdAt: -1 })
+          .toArray();
+        res.send(products);
+      } catch (err) {
+        res.status(500).send({ error: "Failed to fetch products" });
+      }
+    });
+
     app.get("/products/:id", async (req, res) => {
       try {
         const id = req.params.id;
-        const query = { _id: new ObjectId(id) };
-        const product = await productsCollection.findOne(query);
+
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).send({ error: "Invalid product id" });
+        }
+
+        const product = await productsCollection.findOne({
+          _id: new ObjectId(id),
+          status: { $nin: ['draft', 'archived'] },
+        });
         
         if (!product) {
           return res.status(404).send({ error: "Product not found" });
@@ -2502,92 +3189,49 @@ app.get("/api/customers/export/csv", verifyFirebaseToken, verifyAdmin, async (re
         // POST - Create new product
     app.post("/api/products", verifyFirebaseToken, verifyAdmin, async (req, res) => {
       try {
-        const productData = req.body;
+        const { errors, doc } = buildProductDocument(req.body || {});
 
-        // Validate required fields
-        const requiredFields = ['sku', 'productName', 'newPrice', 'stock'];
-        for (const field of requiredFields) {
-          if (!productData[field]) {
-            return res.status(400).json({ 
-              success: false,
-              message: `Missing required field: ${field}` 
-            });
-          }
-        }
-
-        // Validate images array
-        if (!productData.images || !Array.isArray(productData.images) || productData.images.length === 0) {
-          return res.status(400).json({ 
-            success: false,
-            message: "At least one product image is required" 
-          });
-        }
-
-        // Validate price values
-        if (productData.newPrice <= 0) {
-          return res.status(400).json({ 
-            success: false,
-            message: "Price must be greater than 0" 
-          });
-        }
-
-        if (productData.oldPrice && productData.oldPrice < productData.newPrice) {
-          return res.status(400).json({ 
-            success: false,
-            message: "Old price must be greater than new price" 
-          });
-        }
-
-        // Validate stock
-        if (productData.stock < 0) {
-          return res.status(400).json({ 
-            success: false,
-            message: "Stock cannot be negative" 
-          });
-        }
-
-        // Normalize videos (media.videos + legacy media.video / video mirror)
-        const videoError = applyVideoStructure(productData);
-        if (videoError) {
+        if (errors.length > 0) {
           return res.status(400).json({
             success: false,
-            message: videoError
+            message: errors[0],
+            errors
           });
         }
 
-        // Check if SKU already exists
-        const existingProduct = await productsCollection.findOne({ 
-          sku: productData.sku 
-        });
-        
-        if (existingProduct) {
-          return res.status(400).json({ 
+        // SKU uniqueness (case-insensitive)
+        const duplicate = await productsCollection.findOne(
+          { sku: { $regex: `^${escapeRegex(doc.sku)}$`, $options: 'i' } },
+          { projection: { _id: 1 } }
+        );
+
+        if (duplicate) {
+          return res.status(400).json({
             success: false,
-            message: "Product with this SKU already exists" 
+            message: "Product with this SKU already exists"
           });
         }
 
-        // Add timestamps
-        productData.createdAt = new Date();
-        productData.updatedAt = new Date();
-        
-        if (!productData.status) {
-          productData.status = 'active';
-        }
+        const now = new Date();
+        const productData = { ...doc, soldCount: 0, createdAt: now, updatedAt: now };
 
-        // Insert product
-        const result = await productsCollection.insertOne(productData);
+        await productsCollection.insertOne(productData);
 
         res.status(201).json({
           success: true,
           message: "Product created successfully",
-          product: {
-            _id: result.insertedId,
-            ...productData
-          }
+          product: productData
         });
 
       } catch (err) {
+        if (err.code === 11000) {
+          return res.status(400).json({
+            success: false,
+            message: "Product with this SKU already exists"
+          });
+        }
+
+        console.error('Create product error:', err);
         res.status(500).json({ 
           success: false,
           message: "Error creating product", 
@@ -2597,42 +3241,59 @@ app.get("/api/customers/export/csv", verifyFirebaseToken, verifyAdmin, async (re
     });
 
 
-    // PUT - Update product -
+        // PUT - Update product
     app.put("/api/products/:id", verifyFirebaseToken, verifyAdmin, async (req, res) => {
       try {
         const id = req.params.id;
-        const updateData = req.body;
 
-        // Remove _id if present
-        delete updateData._id;
-
-        // Normalize videos (media.videos + legacy media.video / video mirror)
-        const videoError = applyVideoStructure(updateData);
-        if (videoError) {
+        if (!ObjectId.isValid(id)) {
           return res.status(400).json({
             success: false,
-            message: videoError
+            message: "Invalid product id"
           });
         }
 
-        // Add updated timestamp
-        updateData.updatedAt = new Date();
+        const existing = await productsCollection.findOne({ _id: new ObjectId(id) });
 
-        const result = await productsCollection.updateOne(
-          { _id: new ObjectId(id) },
-          { $set: updateData }
-        );
-
-        if (result.matchedCount === 0) {
+        if (!existing) {
           return res.status(404).json({ 
             success: false,
             message: "Product not found" 
           });
         }
 
-        const updatedProduct = await productsCollection.findOne({ 
-          _id: new ObjectId(id) 
-        });
+        const { errors, doc } = buildProductDocument(req.body || {}, existing);
+
+        if (errors.length > 0) {
+          return res.status(400).json({
+            success: false,
+            message: errors[0],
+            errors
+          });
+        }
+
+        // SKU uniqueness: নিজের SKU বাদ
+        const duplicate = await productsCollection.findOne(
+          {
+            sku: { $regex: `^${escapeRegex(doc.sku)}$`, $options: 'i' },
+            _id: { $ne: new ObjectId(id) }
+          },
+          { projection: { _id: 1 } }
+        );
+
+        if (duplicate) {
+          return res.status(400).json({
+            success: false,
+            message: "Product with this SKU already exists"
+          });
+        }
+
+        await productsCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: { ...doc, updatedAt: new Date() } }
+        );
+
+        const updatedProduct = await productsCollection.findOne({ _id: new ObjectId(id) });
 
         res.json({
           success: true,
@@ -2641,6 +3302,13 @@ app.get("/api/customers/export/csv", verifyFirebaseToken, verifyAdmin, async (re
         });
 
       } catch (err) {
+        if (err.code === 11000) {
+          return res.status(400).json({
+            success: false,
+            message: "Product with this SKU already exists"
+          });
+        }
+
         console.error('Update product error:', err);
         res.status(500).json({ 
           success: false,
@@ -2648,7 +3316,7 @@ app.get("/api/customers/export/csv", verifyFirebaseToken, verifyAdmin, async (re
           error: err.message 
         });
       }
-    });
+    }); 
 
 
     // DELETE - Delete product with Cloudinary cleanup
@@ -2783,7 +3451,7 @@ app.get("/api/customers/export/csv", verifyFirebaseToken, verifyAdmin, async (re
         // DELETE single image from Cloudinary
     app.delete("/api/cloudinary/delete/image", verifyFirebaseToken, verifyAdmin, (req, res) =>
       handleCloudinaryDelete(req, res, 'image')
-    );
+    ); 
 
     // DELETE single video from Cloudinary
     app.delete("/api/cloudinary/delete/video", verifyFirebaseToken, verifyAdmin, (req, res) =>
@@ -3594,7 +4262,6 @@ app.get("/api/checkout/verify/:sessionId", verifyFirebaseToken, async (req, res)
   try {
     const { sessionId } = req.params;
 
-    // Retrieve session from Stripe
     const session = await stripe.checkout.sessions.retrieve(sessionId);
 
     if (!session) {
@@ -3613,7 +4280,6 @@ app.get("/api/checkout/verify/:sessionId", verifyFirebaseToken, async (req, res)
       });
     }
 
-    // Check if already paid — return the existing updated order immediately
     const existingOrder = await ordersCollection.findOne({ orderId: orderId });
 
     if (!existingOrder) {
@@ -3623,7 +4289,6 @@ app.get("/api/checkout/verify/:sessionId", verifyFirebaseToken, async (req, res)
       });
     }
 
-    // If already marked paid (idempotency), just return current state
     if (existingOrder?.payment?.status === 'paid') {
       console.log('⚠️ Order already paid, returning existing data');
       return res.json({
@@ -3634,54 +4299,17 @@ app.get("/api/checkout/verify/:sessionId", verifyFirebaseToken, async (req, res)
       });
     }
 
-    // Stripe says paid → update order in DB
     if (session.payment_status === 'paid') {
-      console.log('✅ Payment confirmed, updating order:', orderId);
+      console.log('✅ Payment confirmed, fulfilling order:', orderId);
 
-      // 1. Update order payment status
-      await ordersCollection.updateOne(
-        { orderId: orderId },
-        {
-          $set: {
-            'payment.status': 'paid',
-            'payment.stripeSessionId': session.id,
-            'payment.stripePaymentIntentId': session.payment_intent,
-            'payment.paidAt': new Date(),
-            status: 'processing',
-            updatedAt: new Date()
-          }
-        }
-      );
-
-      // 2. Clear the cart
-      if (existingOrder?.userId) {
-        await cartsCollection.updateOne(
-          { userId: existingOrder.userId },
-          { $set: { items: [], updatedAt: new Date() } }
-        );
-        console.log('✅ Cart cleared for user:', existingOrder.userId);
-      }
-
-      // 3. Update product stock
-      if (existingOrder?.items?.length > 0) {
-        for (const item of existingOrder.items) {
-          try {
-            await productsCollection.updateOne(
-              { _id: new ObjectId(item.productId) },
-              { 
-                $inc: { stock: -item.qty, soldCount: item.qty },
-                $set: { updatedAt: new Date() }
-              }
-            );
-            console.log(`✅ Stock updated: ${item.productId} (-${item.qty})`);
-          } catch (stockErr) {
-            console.error(`❌ Stock update failed for ${item.productId}:`, stockErr.message);
-          }
-        }
-      }
+      // pending → paid atomic; cart clear ও stock কমানো এখানেই (webhook-এর সঙ্গে একই পথ)
+      await fulfillPaidOrder(orderId, {
+        'payment.stripeSessionId': session.id,
+        'payment.stripePaymentIntentId': session.payment_intent,
+        'payment.paidAt': new Date()
+      });
     }
 
-    // Return the final updated order
     const updatedOrder = await ordersCollection.findOne({ orderId: orderId });
 
     console.log('✅ Verify complete. Payment:', updatedOrder?.payment?.status, '| Order:', updatedOrder?.status);
@@ -3811,86 +4439,132 @@ app.get("/api/users/:userId/orders", verifyFirebaseToken, async (req, res) => {
 // ============================================
 
 app.post("/api/orders/:orderId/refund", verifyFirebaseToken, verifyAdmin, async (req, res) => {
-  try {
-    const { orderId } = req.params;
-    const { reason } = req.body;
+  const { orderId } = req.params;
+  let claimed = false;
 
-    const order = await ordersCollection.findOne({ orderId: orderId });
+  try {
+    const reason = cleanString(req.body?.reason).slice(0, 500) || 'Customer request';
+
+    // Atomic claim: paid -> refunding (দুবার refund আটকায়)
+    const claimResult = await ordersCollection.findOneAndUpdate(
+      { orderId, 'payment.status': 'paid' },
+      { $set: { 'payment.status': 'refunding', updatedAt: new Date() } },
+      { returnDocument: 'before' }
+    );
+
+    const order = unwrapFindOneAndUpdate(claimResult);
 
     if (!order) {
-      return res.status(404).json({
+      const exists = await ordersCollection.findOne({ orderId }, { projection: { _id: 1 } });
+      return res.status(exists ? 400 : 404).json({
         success: false,
-        message: 'Order not found'
+        message: exists
+          ? 'Order is not paid, or is already refunded'
+          : 'Order not found'
       });
     }
 
-    if (order.payment.status !== 'paid') {
-      return res.status(400).json({
-        success: false,
-        message: 'Order is not paid yet'
-      });
-    }
+    claimed = true;
 
-    if (!order.payment.stripePaymentIntentId) {
-      return res.status(400).json({
-        success: false,
-        message: 'No payment intent found'
-      });
-    }
+    const isStripe = order.payment?.method === 'stripe';
+    let refundId = null;
 
-    // Create refund in Stripe
-    const refund = await stripe.refunds.create({
-      payment_intent: order.payment.stripePaymentIntentId,
-      reason: 'requested_by_customer',
-      metadata: {
-        orderId: orderId,
-        reason: reason || 'Customer request'
+    if (isStripe) {
+      if (!order.payment.stripePaymentIntentId) {
+        const err = new Error('No payment intent found for this Stripe order');
+        err.status = 400;
+        throw err;
       }
-    });
 
-    // Update order
+      const refund = await stripe.refunds.create({
+        payment_intent: order.payment.stripePaymentIntentId,
+        reason: 'requested_by_customer',
+        metadata: { orderId, reason }
+      });
+
+      refundId = refund.id;
+    }
+
+    // Stripe refund সফল: এখন থেকে আর 'paid'-এ ফেরানো যাবে না
+    claimed = false;
+
     await ordersCollection.updateOne(
-      { orderId: orderId },
+      { orderId },
       {
         $set: {
           'payment.status': 'refunded',
-          'payment.refundId': refund.id,
+          'payment.refundId': refundId,
+          'payment.refundMethod': isStripe ? 'stripe' : 'manual',
           'payment.refundedAt': new Date(),
-          'payment.refundReason': reason || 'Customer request',
+          'payment.refundReason': reason,
           status: 'refunded',
           updatedAt: new Date()
         }
       }
     );
 
-    // Restore product stock
-    if (order.items) {
-      for (const item of order.items) {
-        await productsCollection.updateOne(
-          { _id: new ObjectId(item.productId) },
-          { 
-            $inc: { 
-              stock: item.qty,
-              soldCount: -item.qty 
-            },
-            $set: { updatedAt: new Date() }
-          }
-        );
-      }
+    // Stock: না-পাঠানো অর্ডারে ডিফল্ট ফেরত, shipped/delivered-এ ডিফল্ট ফেরত নয়।
+    // body-তে { restock: true/false } দিয়ে বদলানো যায়।
+    const restock =
+      typeof req.body?.restock === 'boolean'
+        ? req.body.restock
+        : ['pending', 'processing'].includes(order.status);
+
+    let failedRestore = [];
+    if (restock && !order.stockIssue) {
+      failedRestore = await restoreStock(order.items);
     }
 
     res.json({
       success: true,
-      message: 'Order refunded successfully',
-      refund: refund
+      message: isStripe
+        ? 'Order refunded successfully via Stripe'
+        : 'Order marked as refunded. Please return the money to the customer manually.',
+      refundMethod: isStripe ? 'stripe' : 'manual',
+      stockRestored: restock && !order.stockIssue,
+      stockRestoreFailed: failedRestore.length
     });
 
   } catch (error) {
+    if (claimed) {
+      // Refund ব্যর্থ হয়েছে: অর্ডার আবার 'paid'-এ
+      await ordersCollection
+        .updateOne({ orderId }, { $set: { 'payment.status': 'paid', updatedAt: new Date() } })
+        .catch((e) => console.error('Refund revert failed:', orderId, e.message));
+    }
+
     console.error('Refund error:', error);
-    res.status(500).json({
+    res.status(error.status || 500).json({
       success: false,
-      message: 'Failed to process refund',
-      error: error.message
+      message: error.message || 'Failed to process refund'
+    });
+  }
+});
+
+// ============================================
+// CANCEL ORDER (Customer, শুধু নিজের pending ও অপরিশোধিত অর্ডার)
+// ============================================
+app.post("/api/orders/:orderId/cancel", verifyFirebaseToken, async (req, res) => {
+  try {
+    const reason = cleanString(req.body?.reason).slice(0, 500) || 'Cancelled by customer';
+
+    const order = await cancelUnpaidOrder(req.params.orderId, {
+      by: 'customer',
+      ownerEmail: req.tokenEmail,
+      allowedStatuses: ['pending'],
+      reason
+    });
+
+    res.json({
+      success: true,
+      message: 'Order cancelled successfully',
+      order
+    });
+  } catch (error) {
+    console.error('Customer cancel error:', error);
+    res.status(error.status || 500).json({
+      success: false,
+      message: error.message || 'Failed to cancel order'
     });
   }
 });
@@ -3913,24 +4587,52 @@ app.patch("/api/orders/:orderId/status", verifyFirebaseToken, verifyStaff, async
       });
     }
 
-    const result = await ordersCollection.updateOne(
-      { orderId: orderId },
-      {
-        $set: {
-          status: status,
-          updatedAt: new Date()
-        }
-      }
-    );
+    if (status === 'refunded') {
+      return res.status(400).json({
+        success: false,
+        message: 'Use the Refund option to refund an order'
+      });
+    }
 
-    if (result.matchedCount === 0) {
+    const existing = await ordersCollection.findOne({ orderId });
+
+    if (!existing) {
       return res.status(404).json({
         success: false,
         message: 'Order not found'
       });
     }
 
-    const updatedOrder = await ordersCollection.findOne({ orderId: orderId });
+    if (['cancelled', 'refunded'].includes(existing.status)) {
+      return res.status(400).json({
+        success: false,
+        message: `A ${existing.status} order cannot be changed`
+      });
+    }
+
+    // Cancel: stock/coupon ফেরতসহ shared logic দিয়ে
+    if (status === 'cancelled') {
+      const reason = cleanString(req.body?.reason).slice(0, 500) || 'Cancelled by admin';
+
+      const cancelled = await cancelUnpaidOrder(orderId, {
+        by: 'admin',
+        allowedStatuses: ['pending', 'processing'],
+        reason
+      });
+
+      return res.json({
+        success: true,
+        message: 'Order cancelled',
+        order: cancelled
+      });
+    }
+
+    await ordersCollection.updateOne(
+      { orderId },
+      { $set: { status, updatedAt: new Date() } }
+    );
+
+    const updatedOrder = await ordersCollection.findOne({ orderId });
 
     res.json({
       success: true,
@@ -3940,10 +4642,9 @@ app.patch("/api/orders/:orderId/status", verifyFirebaseToken, verifyStaff, async
 
   } catch (error) {
     console.error('Update order status error:', error);
-    res.status(500).json({
+    res.status(error.status || 500).json({
       success: false,
-      message: 'Failed to update order status',
-      error: error.message
+      message: error.message || 'Failed to update order status'
     });
   }
 });
