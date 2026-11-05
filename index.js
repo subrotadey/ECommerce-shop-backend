@@ -42,7 +42,7 @@ app.use(cors({
 
 app.use(cookieParser());
 
-let addressesCollection, ordersCollection, cartsCollection, productsCollection, usersCollection, wishlistsCollection, couponsCollection;;
+let addressesCollection, ordersCollection, cartsCollection, productsCollection, usersCollection, wishlistsCollection, couponsCollection, countersCollection;;
 
 // Add this BEFORE express.json() middleware
 app.post("/api/webhook", 
@@ -851,6 +851,35 @@ const ALLOW_COUPON_WITH_BULK = true; // false করলে bulk ছাড় প
 
 const round2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
 
+// Stripe / COD ব্যাকএন্ডে ডিফল্ট বন্ধ। .env-এ ENABLE_STRIPE=true / ENABLE_COD=true দিলে চালু।
+const ENABLE_STRIPE = process.env.ENABLE_STRIPE === 'true';
+const ENABLE_COD = process.env.ENABLE_COD === 'true';
+
+const requireFeature = (enabled, label) => (req, res, next) => {
+  if (enabled) return next();
+  res.status(403).json({ success: false, message: `${label} is currently not available` });
+};
+
+const historyEntry = (status, by, note = '') => ({ status, by, note, at: new Date() });
+
+// ADA-2026-0001 ফরম্যাট। বছর ধরে আলাদা ক্রমিক সংখ্যা (UAE সময়, UTC+4)।
+async function generateOrderId(retry = true) {
+  const year = new Date(Date.now() + 4 * 60 * 60 * 1000).getUTCFullYear();
+  try {
+    const result = await countersCollection.findOneAndUpdate(
+      { _id: `order-${year}` },
+      { $inc: { seq: 1 } },
+      { upsert: true, returnDocument: 'after' }
+    );
+    const counter = unwrapFindOneAndUpdate(result);
+    return `ADA-${year}-${String(counter.seq).padStart(4, '0')}`;
+  } catch (err) {
+    // বছরের প্রথম দুটি অর্ডার একসাথে এলে upsert-এ duplicate key আসতে পারে: একবার আবার চেষ্টা
+    if (err.code === 11000 && retry) return generateOrderId(false);
+    throw err;
+  }
+}
+
 // প্রতিটি Product + Color গ্রুপ আলাদাভাবে ≥ MOQ কি না। size মিশানো চলবে।
 function validateMoq(pricedItems) {
   const groups = new Map();
@@ -968,7 +997,7 @@ async function priceCartItems(rawItems) {
       name: product.productName,
       price: Number(product.newPrice),
       oldPrice: product.oldPrice,
-      image: item.image || product.images?.[0] || '',
+      image: product.media?.images?.[0]?.url || product.images?.[0]?.url || '',
       size,
       color,
       qty
@@ -1644,6 +1673,7 @@ async function run() {
     ordersCollection = database.collection("orders");
     couponsCollection = database.collection("coupons");
     addressesCollection = database.collection("addresses");
+    countersCollection = database.collection("counters");
 
     console.log("All collections initialized");
 
@@ -2499,32 +2529,43 @@ app.post("/api/admin/users/batch-role", verifyFirebaseToken, verifyAdmin, async 
 // GET - Get all orders (Staff/Admin can access)
 app.get("/api/orders", verifyFirebaseToken, verifyStaff, async (req, res) => {
   try {
-    const { page = 1, limit = 10, status, search } = req.query;
+    const { status, payment, search } = req.query;
+    const pageNum = Math.max(1, parseInt(req.query.page) || 1);
+    const limitNum = Math.min(100, Math.max(1, parseInt(req.query.limit) || 10));
 
     const query = {};
-    
-    if (status) query.status = status;
+
+    if (status) query.status = String(status);
+    if (payment) query['payment.status'] = String(payment);
     if (search) {
+      const s = escapeRegex(String(search).slice(0, 100));
       query.$or = [
-        { orderId: { $regex: search, $options: 'i' } },
-        { 'customer.email': { $regex: search, $options: 'i' } },
+        { orderId: { $regex: s, $options: 'i' } },
+        { 'customer.email': { $regex: s, $options: 'i' } },
+        { 'customer.name': { $regex: s, $options: 'i' } },
+        { 'customer.address.fullName': { $regex: s, $options: 'i' } },
       ];
     }
 
-    const orders = await ordersCollection.find(query)
-      .limit(limit * 1)
-      .skip((page - 1) * limit)
+    const orders = await ordersCollection
+      .find(query)
       .sort({ createdAt: -1 })
+      .skip((pageNum - 1) * limitNum)
+      .limit(limitNum)
       .toArray();
 
     const count = await ordersCollection.countDocuments(query);
+    const totalPages = Math.ceil(count / limitNum);
 
     res.status(200).json({
       success: true,
       orders,
-      totalPages: Math.ceil(count / limit),
-      currentPage: parseInt(page),
+      // পুরোনো ফিল্ড (অন্য পেজের জন্য)
+      totalPages,
+      currentPage: pageNum,
       total: count,
+      // হুকের জন্য
+      pagination: { page: pageNum, limit: limitNum, total: count, totalPages },
     });
   } catch (error) {
     console.error('Get orders error:', error);
@@ -4570,6 +4611,98 @@ app.post("/api/orders/:orderId/cancel", verifyFirebaseToken, async (req, res) =>
 });
 
 // ============================================
+// MARK AS PAID (Admin: bank deposit / COD, হাতে পেমেন্ট নিশ্চিত)
+// ============================================
+app.post("/api/orders/:orderId/mark-paid", verifyFirebaseToken, verifyStaff, async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    const reference = cleanString(req.body?.reference).slice(0, 200);
+    const note = cleanString(req.body?.note).slice(0, 500);
+
+    let receivedAmount = null;
+    const rawAmount = req.body?.receivedAmount;
+    if (rawAmount !== undefined && rawAmount !== null && rawAmount !== '') {
+      receivedAmount = Number(rawAmount);
+      if (!Number.isFinite(receivedAmount) || receivedAmount < 0) {
+        return res.status(400).json({ success: false, message: 'Received amount must be a valid number' });
+      }
+    }
+
+    const existing = await ordersCollection.findOne({ orderId });
+    if (!existing) {
+      return res.status(404).json({ success: false, message: 'Order not found' });
+    }
+
+    // Stripe অর্ডার নিজে নিজেই paid হয়। এখানে শুধু হাতে-পরিশোধ পদ্ধতি।
+    if (!['bank_deposit', 'cod'].includes(existing.payment?.method)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Only bank deposit or COD orders can be marked as paid manually'
+      });
+    }
+
+    const amountMismatch =
+      receivedAmount !== null && round2(receivedAmount) !== round2(existing.pricing?.total);
+
+    const now = new Date();
+
+    // Atomic: শুধু এখনো অপরিশোধিত থাকলেই (double click / race আটকায়)
+    const claim = await ordersCollection.findOneAndUpdate(
+      { orderId, 'payment.status': 'pending', status: { $in: ['pending', 'processing', 'shipped', 'delivered'] } },
+      {
+        $set: {
+          'payment.status': 'paid',
+          'payment.paidAt': now,
+          'payment.paidBy': req.tokenEmail,
+          'payment.reference': reference,
+          'payment.receivedAmount': receivedAmount,
+          'payment.amountMismatch': amountMismatch,
+          updatedAt: now
+        },
+        $push: {
+          statusHistory: { status: 'paid', at: now, by: req.tokenEmail, note: note || reference }
+        }
+      },
+      { returnDocument: 'after' }
+    );
+
+    let order = unwrapFindOneAndUpdate(claim);
+
+    if (!order) {
+      return res.status(409).json({
+        success: false,
+        message: 'Order is not awaiting payment (already paid, cancelled or refunded)'
+      });
+    }
+
+    // নতুন (pending) অর্ডার পরিশোধ হলে processing-এ যায়। shipped/delivered অপরিবর্তিত।
+    // Stock এখানে কমে না, কারণ offline অর্ডারে তৈরির সময়ই কমেছে।
+    if (order.status === 'pending') {
+      await ordersCollection.updateOne(
+        { orderId, status: 'pending' },
+        { $set: { status: 'processing', updatedAt: new Date() } }
+      );
+      order = await ordersCollection.findOne({ orderId });
+    }
+
+    res.json({
+      success: true,
+      message: amountMismatch
+        ? 'Marked as paid, but the received amount differs from the order total'
+        : 'Order marked as paid',
+      amountMismatch,
+      order
+    });
+  } catch (error) {
+    console.error('Mark as paid error:', error);
+    res.status(error.status || 500).json({
+      success: false,
+      message: error.message || 'Failed to mark order as paid'
+    });
+  }
+});
+
+// ============================================
 // UPDATE ORDER STATUS (Staff/Admin)
 // ============================================
 
@@ -4657,6 +4790,12 @@ app.get("/api/orders/stats/overview", verifyFirebaseToken, verifyAdmin, async (r
     const processingOrders = await ordersCollection.countDocuments({ status: 'processing' });
     const shippedOrders = await ordersCollection.countDocuments({ status: 'shipped' });
     const deliveredOrders = await ordersCollection.countDocuments({ status: 'delivered' });
+    const cancelledOrders = await ordersCollection.countDocuments({ status: 'cancelled' });
+    const refundedOrders = await ordersCollection.countDocuments({ status: 'refunded' });
+    const awaitingPayment = await ordersCollection.countDocuments({
+      'payment.status': 'pending',
+      status: { $nin: ['cancelled', 'refunded'] }
+    });
     
     const totalRevenue = await ordersCollection.aggregate([
       { $match: { 'payment.status': 'paid' } },
@@ -4671,6 +4810,9 @@ app.get("/api/orders/stats/overview", verifyFirebaseToken, verifyAdmin, async (r
         processingOrders,
         shippedOrders,
         deliveredOrders,
+        cancelledOrders,
+        refundedOrders,
+        awaitingPayment,
         totalRevenue: totalRevenue[0]?.total || 0
       }
     });
