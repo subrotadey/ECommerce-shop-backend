@@ -337,6 +337,63 @@ async function handleCloudinaryDelete(req, res, resourceType) {
   }
 }
 
+// Cloudinary secure_url থেকে publicId বের করে।
+// নমুনা: https://res.cloudinary.com/<cloud>/image/upload/v123/user-profiles/abc.jpg
+// -> "user-profiles/abc" (version থাকা বাধ্যতামূলক, নইলে null)
+function getCloudinaryPublicIdFromUrl(url) {
+  if (typeof url !== 'string') return null;
+
+  const marker = `res.cloudinary.com/${process.env.CLOUDINARY_CLOUD_NAME}/image/upload/`;
+  const index = url.indexOf(marker);
+  if (index === -1) return null;
+
+  const parts = url.slice(index + marker.length).split('?')[0].split('/');
+  const versionIndex = parts.findIndex((p) => /^v\d+$/.test(p));
+  if (versionIndex === -1) return null;
+
+  const raw = parts.slice(versionIndex + 1).join('/').replace(/\.[^/.]+$/, '');
+  if (!raw) return null;
+
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return null;
+  }
+}
+
+// প্রোফাইল ছবি বদলের পর পুরোনোটি মোছে। কখনো throw করে না।
+// ফেরত: 'deleted' | 'skipped' | 'in_use' | 'failed'
+async function deleteReplacedProfilePhoto(oldUrl, newUrl) {
+  if (!oldUrl || oldUrl === newUrl) return 'skipped';
+
+  const publicId = getCloudinaryPublicIdFromUrl(oldUrl);
+  if (!publicId) return 'skipped'; // Google/অন্য সাইটের ছবি
+
+  try {
+    // কোনো product ব্যবহার করলে মোছা নয়
+    if (await isCloudinaryAssetInUse(publicId)) return 'in_use';
+
+    // অন্য কোনো user একই ছবি ব্যবহার করলে মোছা নয়
+    const sharedWith = await usersCollection.findOne(
+      { photoURL: oldUrl },
+      { projection: { _id: 1 } }
+    );
+    if (sharedWith) return 'in_use';
+
+    const result = await cloudinary.uploader.destroy(publicId, {
+      invalidate: true,
+      resource_type: 'image',
+    });
+
+    return result.result === 'ok' || result.result === 'not found'
+      ? 'deleted'
+      : 'failed';
+  } catch (err) {
+    console.error('Old profile photo cleanup failed:', publicId, err.message);
+    return 'failed';
+  }
+}
+
 // ============================================
 // PRODUCT VALIDATION HELPERS
 // ============================================
@@ -862,22 +919,31 @@ const requireFeature = (enabled, label) => (req, res, next) => {
 
 const historyEntry = (status, by, note = '') => ({ status, by, note, at: new Date() });
 
-// ADA-2026-0001 ফরম্যাট। বছর ধরে আলাদা ক্রমিক সংখ্যা (UAE সময়, UTC+4)।
-async function generateOrderId(retry = true) {
-  const year = new Date(Date.now() + 4 * 60 * 60 * 1000).getUTCFullYear();
-  try {
-    const result = await countersCollection.findOneAndUpdate(
-      { _id: `order-${year}` },
-      { $inc: { seq: 1 } },
-      { upsert: true, returnDocument: 'after' }
-    );
-    const counter = unwrapFindOneAndUpdate(result);
-    return `ADA-${year}-${String(counter.seq).padStart(4, '0')}`;
-  } catch (err) {
-    // বছরের প্রথম দুটি অর্ডার একসাথে এলে upsert-এ duplicate key আসতে পারে: একবার আবার চেষ্টা
-    if (err.code === 11000 && retry) return generateOrderId(false);
-    throw err;
+// AAU-20261106-K7M3QX ফরম্যাট। তারিখ (UAE সময়, UTC+4) + ৬ অক্ষরের random কোড।
+// কোডে 0/O, 1/I/L বাদ, যাতে WhatsApp-এ পড়তে ভুল না হয়।
+const ORDER_CODE_CHARS = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+
+async function generateOrderId() {
+  const { randomInt } = require('crypto');
+
+  const uae = new Date(Date.now() + 4 * 60 * 60 * 1000);
+  const day =
+    String(uae.getUTCFullYear()) +
+    String(uae.getUTCMonth() + 1).padStart(2, '0') +
+    String(uae.getUTCDate()).padStart(2, '0');
+
+  for (let attempt = 0; attempt < 5; attempt++) {
+    let code = '';
+    for (let i = 0; i < 6; i++) {
+      code += ORDER_CODE_CHARS[randomInt(ORDER_CODE_CHARS.length)];
+    }
+    const orderId = `AAU-${day}-${code}`;
+
+    const exists = await ordersCollection.findOne({ orderId }, { projection: { _id: 1 } });
+    if (!exists) return orderId;
   }
+
+  throw new Error('Could not generate a unique order ID. Please try again.');
 }
 
 // প্রতিটি Product + Color গ্রুপ আলাদাভাবে ≥ MOQ কি না। size মিশানো চলবে।
@@ -1293,7 +1359,8 @@ async function cancelUnpaidOrder(orderId, { by, reason, allowedStatuses, ownerEm
         cancelledBy: by,
         cancelReason: reason,
         updatedAt: new Date()
-      }
+      },
+      $push: { statusHistory: historyEntry('cancelled', by, reason) }
     },
     { returnDocument: 'after' }
   );
@@ -1344,7 +1411,7 @@ async function createOfflineOrder({ req, paymentMethod, items, couponCode, shipp
   const appliedCoupon = couponDoc && pricing.couponDiscount > 0 ? couponDoc : null;
 
   const user = await usersCollection.findOne({ email: customerEmail });
-  const orderId = `ORD-${Date.now()}-${Math.random().toString(36).substr(2, 9).toUpperCase()}`;
+  const orderId = await generateOrderId();
 
   const orderData = {
     orderId,
@@ -1363,6 +1430,7 @@ async function createOfflineOrder({ req, paymentMethod, items, couponCode, shipp
       status: 'pending',
     },
     status: 'pending',
+    statusHistory: [historyEntry('pending', customerEmail, 'Order placed')],
     createdAt: new Date(),
     updatedAt: new Date()
   };
@@ -1430,16 +1498,29 @@ async function createNotification({ audience, email, type, title, message, order
   }
 }
 
-const notifyCustomer = (order, type, title, message) =>
-  createNotification({
+const notifyCustomer = async (order, type, title, message) => {
+  const email = String(order?.customer?.email || order?.userId || '').toLowerCase();
+  try {
+    const u = await usersCollection.findOne(
+      { email },
+      { projection: { 'preferences.notifications': 1 } }
+    );
+    // ক্রেতা বন্ধ করে রাখলে নোটিফিকেশন তৈরি হবে না
+    if (u?.preferences?.notifications === false) return;
+  } catch (err) {
+    console.error('Preference check failed:', err.message);
+  }
+
+  return createNotification({
     audience: 'user',
-    email: order?.customer?.email || order?.userId,
+    email,
     type,
     title,
     message,
     orderId: order?.orderId,
     link: '/orders'
   });
+};
 
 async function fulfillPaidOrder(orderId, extraPaymentFields = {}) {
   const result = await ordersCollection.findOneAndUpdate(
@@ -1686,7 +1767,9 @@ async function handleSuccessfulPayment(session) {
 
 
 // MongoDB connection
-const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.hs9qs.mongodb.net/?retryWrites=true&w=majority`;
+const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.tq35glq.mongodb.net/?retryWrites=true&w=majority`;
+// const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.hs9qs.mongodb.net/?retryWrites=true&w=majority`;
+
 
 const client = new MongoClient(uri, {
   serverApi: {
@@ -1697,8 +1780,6 @@ const client = new MongoClient(uri, {
   serverSelectionTimeoutMS: 10000, // 10 seconds
   socketTimeoutMS: 45000,
 });
-
-
 
 async function run() {
   try {
@@ -1728,35 +1809,15 @@ async function run() {
     } catch (indexError) {
       console.error('SKU index creation failed:', indexError.message);
     }
-
-    // ============================================
-    // JWT VERIFICATION MIDDLEWARE
-    // ============================================
-    // function verifyJWT(req, res, next) {
-    //   const authHeader = req.headers.authorization;
-    //   if (!authHeader) {
-    //     return res.status(401).send({ error: "Unauthorized access" });
-    //   }
-
-    //   const token = authHeader.split(" ")[1];
-
-    //   jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
-    //     if (err) {
-    //       return res.status(403).send({ error: "Forbidden access" });
-    //     }
-    //     req.decoded = decoded;
-    //     next();
-    //   });
-    // }
-
-    // JWT TOKEN GENERATION ROUTE
-    // app.post("/jwt", (req, res) => {
-    //   const user = req.body;
-    //   const token = jwt.sign(user, process.env.JWT_SECRET, {
-    //     expiresIn: "7d",
-    //   });
-    //   res.send({ token });
-    // });
+    // orderId database level-এও unique (দুটো request একসঙ্গে এলে race আটকায়)
+    try {
+      await ordersCollection.createIndex(
+        { orderId: 1 },
+        { unique: true, name: 'orderId_unique' }
+      );
+    } catch (indexError) {
+      console.error('orderId index creation failed:', indexError.message);
+    }
 
     // ============================================
     // ROUTES
@@ -1907,6 +1968,8 @@ app.post("/jwt", verifyFirebaseToken, (req, res) => {
         // Initialize default values
         let recentOrders = [];
         let ordersCount = 0;
+        let totalSpent = 0;
+        let pendingOrders = 0;
 
         // Try to get orders (orders collection may not exist yet)
         try {
@@ -1927,6 +1990,13 @@ app.post("/jwt", verifyFirebaseToken, (req, res) => {
               { 'customer.email': user.email }
             ]
           });
+          const mine = { $or: [{ userId: user.uid }, { 'customer.email': user.email }] };
+          const spent = await ordersCollection.aggregate([
+            { $match: { ...mine, 'payment.status': 'paid' } },
+            { $group: { _id: null, total: { $sum: '$pricing.total' } } }
+          ]).toArray();
+          totalSpent = spent[0]?.total || 0;
+          pendingOrders = await ordersCollection.countDocuments({ ...mine, status: 'pending' });
         } catch (orderError) {
           console.log('Orders collection not found or empty:', orderError.message);
           // Continue with empty orders
@@ -1954,7 +2024,9 @@ app.post("/jwt", verifyFirebaseToken, (req, res) => {
             ...user,
             recentOrders: recentOrders,
             wishlistCount: wishlistCount,
-            ordersCount: ordersCount
+            ordersCount: ordersCount,
+            totalSpent,
+            pendingOrders
           },
         });
       } catch (error) {
@@ -1981,6 +2053,8 @@ app.post("/jwt", verifyFirebaseToken, (req, res) => {
           });
         }
 
+        const previousPhotoURL = user.photoURL;
+
         // Build update object
         const updateData = { updatedAt: new Date() };
         
@@ -1995,12 +2069,19 @@ app.post("/jwt", verifyFirebaseToken, (req, res) => {
           { $set: updateData }
         );
 
+        // DB আপডেট সফল হওয়ার পরেই পুরোনো ছবি মোছা
+        let photoCleanup = 'skipped';
+        if (photoURL && photoURL !== previousPhotoURL) {
+          photoCleanup = await deleteReplacedProfilePhoto(previousPhotoURL, photoURL);
+        }
+
         const updatedUser = await usersCollection.findOne({ uid: req.uid });
 
         res.status(200).json({
           success: true,
           message: 'Profile updated successfully',
           user: updatedUser,
+          photoCleanup,
         });
       } catch (error) {
         console.error('Update profile error:', error);
@@ -4250,7 +4331,7 @@ app.post("/api/create-checkout-session", verifyFirebaseToken, async (req, res) =
     console.log('   Total:', total);
 
     // Generate unique order ID
-    const orderId = `ORD-${Date.now()}-${Math.random().toString(36).substr(2, 9).toUpperCase()}`;
+    const orderId = await generateOrderId();
 
     // Convert items to Stripe line items
     const lineItems = items.map(item => {
@@ -4667,7 +4748,8 @@ app.post("/api/orders/:orderId/refund", verifyFirebaseToken, verifyAdmin, async 
           'payment.refundReason': reason,
           status: 'refunded',
           updatedAt: new Date()
-        }
+        },
+        $push: { statusHistory: historyEntry('refunded', req.tokenEmail, reason) }
       }
     );
 
@@ -4917,9 +4999,12 @@ app.patch("/api/orders/:orderId/status", verifyFirebaseToken, verifyStaff, async
       });
     }
 
-    await ordersCollection.updateOne(
+        await ordersCollection.updateOne(
       { orderId },
-      { $set: { status, updatedAt: new Date() } }
+      {
+        $set: { status, updatedAt: new Date() },
+        $push: { statusHistory: historyEntry(status, req.tokenEmail) }
+      }
     );
 
     const updatedOrder = await ordersCollection.findOne({ orderId });
