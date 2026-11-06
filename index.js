@@ -42,7 +42,7 @@ app.use(cors({
 
 app.use(cookieParser());
 
-let addressesCollection, ordersCollection, cartsCollection, productsCollection, usersCollection, wishlistsCollection, couponsCollection, countersCollection;;
+let addressesCollection, ordersCollection, cartsCollection, productsCollection, usersCollection, wishlistsCollection, couponsCollection, countersCollection, notificationsCollection;
 
 // Add this BEFORE express.json() middleware
 app.post("/api/webhook", 
@@ -1384,7 +1384,16 @@ async function createOfflineOrder({ req, paymentMethod, items, couponCode, shipp
     await restoreStock(pricedItems);
     throw insertErr;
   }
-
+    await createNotification({
+    audience: 'staff',
+    type: 'order_new',
+    title: 'New order',
+    message: `${orderData.orderId} · ${pricing.currency} ${pricing.total} · ${
+      paymentMethod === 'bank_deposit' ? 'awaiting bank transfer' : 'cash on delivery'
+    }`,
+    orderId: orderData.orderId,
+    link: '/admin/orders'
+  });
   await cartsCollection.updateOne(
     { userId },
     { $set: { items: [], updatedAt: new Date() } }
@@ -1399,6 +1408,38 @@ function unwrapFindOneAndUpdate(result) {
   if (Object.prototype.hasOwnProperty.call(result, 'value')) return result.value;
   return result;
 }
+
+// ── Notifications ──
+// ── Notifications ──
+async function createNotification({ audience, email, type, title, message, orderId, link }) {
+  try {
+    await notificationsCollection.insertOne({
+      audience,
+      email: audience === 'user' ? String(email || '').toLowerCase() : null,
+      type,
+      title,
+      message,
+      orderId: orderId || null,
+      link: link || null,
+      readBy: [],
+      read: false,
+      createdAt: new Date()
+    });
+  } catch (err) {
+    console.error('Notification error:', err.message);
+  }
+}
+
+const notifyCustomer = (order, type, title, message) =>
+  createNotification({
+    audience: 'user',
+    email: order?.customer?.email || order?.userId,
+    type,
+    title,
+    message,
+    orderId: order?.orderId,
+    link: '/orders'
+  });
 
 async function fulfillPaidOrder(orderId, extraPaymentFields = {}) {
   const result = await ordersCollection.findOneAndUpdate(
@@ -1674,6 +1715,7 @@ async function run() {
     couponsCollection = database.collection("coupons");
     addressesCollection = database.collection("addresses");
     countersCollection = database.collection("counters");
+    notificationsCollection = database.collection("notifications");
 
     console.log("All collections initialized");
 
@@ -2297,6 +2339,91 @@ app.get("/api/admin/stats/dashboard", verifyFirebaseToken, verifyAdmin, async (r
   } catch (error) {
     console.error("Dashboard stats error:", error);
     res.status(500).json({ success: false, message: "Failed to fetch dashboard stats", error: error.message });
+  }
+});
+
+// ============================================
+// NOTIFICATIONS
+// ============================================
+const getNotifContext = async (req) => {
+  const email = String(req.tokenEmail || '').toLowerCase();
+  const scope = req.query.scope === 'staff' ? 'staff' : 'me';
+
+  if (scope === 'staff') {
+    const user = await usersCollection.findOne({ email });
+    if (!user || !['admin', 'staff'].includes(user.role)) return { denied: true };
+  }
+
+  return {
+    scope,
+    email,
+    filter: scope === 'staff' ? { audience: 'staff' } : { audience: 'user', email },
+    unreadFilter: scope === 'staff' ? { readBy: { $ne: email } } : { read: false }
+  };
+};
+
+app.get("/api/notifications", verifyFirebaseToken, async (req, res) => {
+  try {
+    const ctx = await getNotifContext(req);
+    if (ctx.denied) return res.status(403).json({ success: false, message: 'Access denied' });
+
+    const limit = Math.min(50, Math.max(1, parseInt(req.query.limit) || 20));
+
+    const [items, unreadCount] = await Promise.all([
+      notificationsCollection.find(ctx.filter).sort({ createdAt: -1 }).limit(limit).toArray(),
+      notificationsCollection.countDocuments({ ...ctx.filter, ...ctx.unreadFilter })
+    ]);
+
+    const notifications = items.map((n) => ({
+      id: String(n._id),
+      type: n.type,
+      title: n.title,
+      message: n.message,
+      orderId: n.orderId,
+      link: n.link,
+      createdAt: n.createdAt,
+      unread: ctx.scope === 'staff' ? !(n.readBy || []).includes(ctx.email) : !n.read
+    }));
+
+    res.json({ success: true, notifications, unreadCount });
+  } catch (error) {
+    console.error('Get notifications error:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch notifications' });
+  }
+});
+
+app.post("/api/notifications/read-all", verifyFirebaseToken, async (req, res) => {
+  try {
+    const ctx = await getNotifContext(req);
+    if (ctx.denied) return res.status(403).json({ success: false, message: 'Access denied' });
+
+    const result = await notificationsCollection.updateMany(
+      { ...ctx.filter, ...ctx.unreadFilter },
+      ctx.scope === 'staff' ? { $addToSet: { readBy: ctx.email } } : { $set: { read: true } }
+    );
+    res.json({ success: true, matched: result.matchedCount, modified: result.modifiedCount });
+  } catch (error) {
+    console.error('Read-all notifications error:', error);
+    res.status(500).json({ success: false, message: 'Failed to update notifications' });
+  }
+});
+
+app.patch("/api/notifications/:id/read", verifyFirebaseToken, async (req, res) => {
+  try {
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ success: false, message: 'Invalid id' });
+    }
+    const ctx = await getNotifContext(req);
+    if (ctx.denied) return res.status(403).json({ success: false, message: 'Access denied' });
+
+    await notificationsCollection.updateOne(
+      { _id: new ObjectId(req.params.id), ...ctx.filter },
+      ctx.scope === 'staff' ? { $addToSet: { readBy: ctx.email } } : { $set: { read: true } }
+    );
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Mark notification read error:', error);
+    res.status(500).json({ success: false, message: 'Failed to update notification' });
   }
 });
 
@@ -4544,6 +4671,13 @@ app.post("/api/orders/:orderId/refund", verifyFirebaseToken, verifyAdmin, async 
       }
     );
 
+    await notifyCustomer(
+      order,
+      'order_refunded',
+      'Refund processed',
+      `Your order ${order.orderId} has been refunded.`
+    );
+
     // Stock: না-পাঠানো অর্ডারে ডিফল্ট ফেরত, shipped/delivered-এ ডিফল্ট ফেরত নয়।
     // body-তে { restock: true/false } দিয়ে বদলানো যায়।
     const restock =
@@ -4594,6 +4728,15 @@ app.post("/api/orders/:orderId/cancel", verifyFirebaseToken, async (req, res) =>
       ownerEmail: req.tokenEmail,
       allowedStatuses: ['pending'],
       reason
+    });
+
+    await createNotification({
+      audience: 'staff',
+      type: 'order_cancelled',
+      title: 'Order cancelled by customer',
+      message: `${order.orderId} was cancelled by the customer`,
+      orderId: order.orderId,
+      link: '/admin/orders'
     });
 
     res.json({
@@ -4685,6 +4828,13 @@ app.post("/api/orders/:orderId/mark-paid", verifyFirebaseToken, verifyStaff, asy
       order = await ordersCollection.findOne({ orderId });
     }
 
+    await notifyCustomer(
+      order,
+      'payment_received',
+      'Payment received',
+      `We received your payment for order ${order.orderId}. Your order is confirmed.`
+    );
+
     res.json({
       success: true,
       message: amountMismatch
@@ -4753,6 +4903,13 @@ app.patch("/api/orders/:orderId/status", verifyFirebaseToken, verifyStaff, async
         reason
       });
 
+      await notifyCustomer(
+        cancelled,
+        'order_cancelled',
+        'Order cancelled',
+        `Your order ${cancelled.orderId} was cancelled by the store.`
+      );
+
       return res.json({
         success: true,
         message: 'Order cancelled',
@@ -4766,6 +4923,20 @@ app.patch("/api/orders/:orderId/status", verifyFirebaseToken, verifyStaff, async
     );
 
     const updatedOrder = await ordersCollection.findOne({ orderId });
+
+    const STATUS_TEXT = {
+      processing: 'is being prepared',
+      shipped: 'has been shipped',
+      delivered: 'has been delivered'
+    };
+    if (STATUS_TEXT[status] && status !== existing.status) {
+      await notifyCustomer(
+        updatedOrder,
+        `order_${status}`,
+        'Order update',
+        `Your order ${updatedOrder.orderId} ${STATUS_TEXT[status]}.`
+      );
+    }
 
     res.json({
       success: true,
@@ -4783,7 +4954,7 @@ app.patch("/api/orders/:orderId/status", verifyFirebaseToken, verifyStaff, async
 });
 
 // GET - Order Statistics (Admin)
-app.get("/api/orders/stats/overview", verifyFirebaseToken, verifyAdmin, async (req, res) => {
+app.get("/api/orders/stats/overview", verifyFirebaseToken, verifyStaff, async (req, res) => {
   try {
     const totalOrders = await ordersCollection.countDocuments();
     const pendingOrders = await ordersCollection.countDocuments({ status: 'pending' });
