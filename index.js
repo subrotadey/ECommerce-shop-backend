@@ -42,7 +42,7 @@ app.use(cors({
 
 app.use(cookieParser());
 
-let addressesCollection, ordersCollection, cartsCollection, productsCollection, usersCollection, wishlistsCollection, couponsCollection, countersCollection, notificationsCollection;
+let addressesCollection, ordersCollection, cartsCollection, productsCollection, usersCollection, wishlistsCollection, couponsCollection, countersCollection, notificationsCollection, siteSettingsCollection;
 
 // Add this BEFORE express.json() middleware
 app.post("/api/webhook", 
@@ -1797,6 +1797,7 @@ async function run() {
     addressesCollection = database.collection("addresses");
     countersCollection = database.collection("counters");
     notificationsCollection = database.collection("notifications");
+    siteSettingsCollection = database.collection("siteSettings");
 
     console.log("All collections initialized");
 
@@ -1831,6 +1832,152 @@ async function run() {
         timestamp: new Date().toISOString()
       });
     });
+
+        // ============================================
+    // SITE IMAGES (logo + Home section images)
+    // ============================================
+    const SITE_IMAGE_SLOTS = [
+      'logo',
+      'hero1', 'hero2', 'hero3',
+      'cat1', 'cat2', 'cat3', 'cat4', 'cat5', 'cat6',
+      'feat1', 'feat2', 'feat3', 'feat4',
+    ];
+    const SITE_IMAGE_FOLDER = 'site-images';
+
+    const destroySiteImage = async (publicId) => {
+      if (!publicId) return;
+      try {
+        await cloudinary.uploader.destroy(publicId, {
+          invalidate: true,
+          resource_type: 'image',
+        });
+      } catch (err) {
+        console.error('Site image cleanup failed:', publicId, err.message);
+      }
+    };
+
+    // PUBLIC: শুধু slot -> url
+    app.get('/api/site-settings', async (req, res) => {
+      try {
+        const doc = await siteSettingsCollection.findOne({ _id: 'main' });
+        const images = {};
+        for (const slot of SITE_IMAGE_SLOTS) {
+          if (doc?.images?.[slot]?.url) images[slot] = doc.images[slot].url;
+        }
+        res.json({ success: true, images });
+      } catch (error) {
+        console.error('Site settings error:', error);
+        res.status(500).json({ success: false, message: 'Failed to load site settings' });
+      }
+    });
+
+    // ADMIN: signed upload তথ্য
+    app.get(
+      '/api/site-settings/upload-signature',
+      verifyFirebaseToken,
+      verifyAdmin,
+      (req, res) => {
+        try {
+          const timestamp = Math.round(Date.now() / 1000);
+          const signature = cloudinary.utils.api_sign_request(
+            { folder: SITE_IMAGE_FOLDER, timestamp },
+            process.env.CLOUDINARY_API_SECRET
+          );
+          res.json({
+            success: true,
+            timestamp,
+            signature,
+            folder: SITE_IMAGE_FOLDER,
+            apiKey: process.env.CLOUDINARY_API_KEY,
+            cloudName: process.env.CLOUDINARY_CLOUD_NAME,
+          });
+        } catch (error) {
+          res.status(500).json({ success: false, message: 'Could not sign upload' });
+        }
+      }
+    );
+
+    // ADMIN: একটি slot-এ ছবি বসানো
+    app.put(
+      '/api/site-settings/images/:slot',
+      verifyFirebaseToken,
+      verifyAdmin,
+      async (req, res) => {
+        try {
+          const { slot } = req.params;
+          if (!SITE_IMAGE_SLOTS.includes(slot)) {
+            return res.status(400).json({ success: false, message: 'Unknown image slot' });
+          }
+
+          const url = cleanString(req.body?.url);
+          const publicId = cleanString(req.body?.publicId);
+          const prefix = `https://res.cloudinary.com/${process.env.CLOUDINARY_CLOUD_NAME}/image/upload/`;
+
+          if (
+            !url.startsWith(prefix) ||
+            !publicId.startsWith(`${SITE_IMAGE_FOLDER}/`) ||
+            !url.includes(publicId)
+          ) {
+            return res.status(400).json({ success: false, message: 'Invalid image data' });
+          }
+
+          const result = await siteSettingsCollection.findOneAndUpdate(
+            { _id: 'main' },
+            {
+              $set: {
+                [`images.${slot}`]: {
+                  url,
+                  publicId,
+                  updatedBy: req.tokenEmail,
+                  updatedAt: new Date(),
+                },
+                updatedAt: new Date(),
+              },
+            },
+            { upsert: true, returnDocument: 'before' }
+          );
+
+          const old = unwrapFindOneAndUpdate(result)?.images?.[slot];
+          if (old?.publicId && old.publicId !== publicId) {
+            await destroySiteImage(old.publicId);
+          }
+
+          res.json({ success: true, slot, url });
+        } catch (error) {
+          console.error('Site image save error:', error);
+          res.status(500).json({ success: false, message: 'Failed to save image' });
+        }
+      }
+    );
+
+    // ADMIN: default ছবিতে ফেরা
+    app.delete(
+      '/api/site-settings/images/:slot',
+      verifyFirebaseToken,
+      verifyAdmin,
+      async (req, res) => {
+        try {
+          const { slot } = req.params;
+          if (!SITE_IMAGE_SLOTS.includes(slot)) {
+            return res.status(400).json({ success: false, message: 'Unknown image slot' });
+          }
+
+          const result = await siteSettingsCollection.findOneAndUpdate(
+            { _id: 'main' },
+            { $unset: { [`images.${slot}`]: '' }, $set: { updatedAt: new Date() } },
+            { returnDocument: 'before' }
+          );
+
+          const old = unwrapFindOneAndUpdate(result)?.images?.[slot];
+          if (old?.publicId) await destroySiteImage(old.publicId);
+
+          res.json({ success: true, slot });
+        } catch (error) {
+          console.error('Site image reset error:', error);
+          res.status(500).json({ success: false, message: 'Failed to reset image' });
+        }
+      }
+    );
 
 app.post("/jwt", verifyFirebaseToken, (req, res) => {
   const token = jwt.sign(
@@ -2365,7 +2512,7 @@ app.get("/api/admin/stats/dashboard", verifyFirebaseToken, verifyAdmin, async (r
     const thisMonthRevenue = thisMonthRevAgg[0]?.revenue || 0;
     const lastMonthRevenue = lastMonthRevAgg[0]?.revenue || 0;
     const revenueGrowth = lastMonthRevenue === 0
-      ? (thisMonthRevenue > 0 ? 100 : 0)
+            ? null
       : parseFloat((((thisMonthRevenue - lastMonthRevenue) / lastMonthRevenue) * 100).toFixed(1));
  
     // ── Orders ───────────────────────────────────────────────────────
@@ -2377,9 +2524,9 @@ app.get("/api/admin/stats/dashboard", verifyFirebaseToken, verifyAdmin, async (r
       : parseFloat((((thisMonthOrders - lastMonthOrders) / lastMonthOrders) * 100).toFixed(1));
  
     // ── Customers ────────────────────────────────────────────────────
-    const totalCustomers     = await usersCollection.countDocuments();
-    const thisMonthCustomers = await usersCollection.countDocuments({ createdAt: { $gte: startOfThisMonth } });
-    const lastMonthCustomers = await usersCollection.countDocuments({ createdAt: { $gte: startOfLastMonth, $lte: endOfLastMonth } });
+    const totalCustomers     = await usersCollection.countDocuments({ role: 'user' });
+    const thisMonthCustomers = await usersCollection.countDocuments({ role: 'user', createdAt: { $gte: startOfThisMonth } });
+    const lastMonthCustomers = await usersCollection.countDocuments({ role: 'user', createdAt: { $gte: startOfLastMonth, $lte: endOfLastMonth } });
     const customersGrowth    = lastMonthCustomers === 0
       ? (thisMonthCustomers > 0 ? 100 : 0)
       : parseFloat((((thisMonthCustomers - lastMonthCustomers) / lastMonthCustomers) * 100).toFixed(1));
@@ -2392,11 +2539,20 @@ app.get("/api/admin/stats/dashboard", verifyFirebaseToken, verifyAdmin, async (r
       ? (thisMonthProducts > 0 ? 100 : 0)
       : parseFloat((((thisMonthProducts - lastMonthProducts) / lastMonthProducts) * 100).toFixed(1));
  
+
+          // ── Action items ─────────────────────────────────────────────────
+    const awaitingAgg = await ordersCollection.aggregate([
+      { $match: { "payment.status": "pending", status: { $nin: ["cancelled", "refunded"] } } },
+      { $group: { _id: null, count: { $sum: 1 }, amount: { $sum: "$pricing.total" } } }
+    ]).toArray();
+    const awaitingPayment = awaitingAgg[0]?.count || 0;
+    const awaitingAmount  = awaitingAgg[0]?.amount || 0;
+    const processingOrders = await ordersCollection.countDocuments({ status: "processing" });
     // ── Recent Orders (last 5) ────────────────────────────────────────
     const recentOrders = await ordersCollection
       .find({})
       .sort({ createdAt: -1 })
-      .limit(5)
+      .limit(8)
       .toArray();
  
     res.json({
@@ -2413,7 +2569,10 @@ app.get("/api/admin/stats/dashboard", verifyFirebaseToken, verifyAdmin, async (r
         thisMonthCustomers,
         totalProducts,
         productsGrowth,
-        thisMonthProducts
+        thisMonthProducts,
+        awaitingPayment,
+        awaitingAmount,
+        processingOrders
       },
       recentOrders
     });
@@ -2666,7 +2825,8 @@ app.get("/api/admin/stats/top-products", verifyFirebaseToken, verifyAdmin, async
             ]
           },
           sales:   1,
-          revenue: { $round: ["$revenue", 2] }
+          revenue: { $round: ["$revenue", 2] },
+          inCatalog: { $gt: [{ $size: "$productInfo" }, 0] }
         }
       }
     ]).toArray();
@@ -2678,6 +2838,47 @@ app.get("/api/admin/stats/top-products", verifyFirebaseToken, verifyAdmin, async
   }
 });
 
+
+// ============================================
+// TOP CUSTOMERS (paid orders, by pieces)
+// GET /api/admin/stats/top-customers
+// ============================================
+app.get("/api/admin/stats/top-customers", verifyFirebaseToken, verifyAdmin, async (req, res) => {
+  try {
+    const topCustomers = await ordersCollection.aggregate([
+      { $match: { "payment.status": "paid" } },
+      { $sort: { createdAt: 1 } }, // $last যেন সবচেয়ে নতুন নাম ধরে
+      {
+        $group: {
+          _id: { $toLower: "$customer.email" },
+          name: { $last: { $ifNull: ["$customer.address.fullName", "$customer.name"] } },
+          pieces: { $sum: "$pricing.totalQuantity" },
+          orders: { $sum: 1 },
+          spent: { $sum: "$pricing.total" },
+          lastOrderAt: { $max: "$createdAt" }
+        }
+      },
+      { $sort: { pieces: -1, spent: -1 } },
+      { $limit: 5 },
+      {
+        $project: {
+          _id: 0,
+          email: "$_id",
+          name: 1,
+          pieces: 1,
+          orders: 1,
+          spent: { $round: ["$spent", 2] },
+          lastOrderAt: 1
+        }
+      }
+    ]).toArray();
+
+    res.json({ success: true, topCustomers });
+  } catch (error) {
+    console.error("Top customers error:", error);
+    res.status(500).json({ success: false, message: "Failed to fetch top customers", error: error.message });
+  }
+});
 
 
 // ============================================
