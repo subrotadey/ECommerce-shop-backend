@@ -1411,6 +1411,11 @@ async function createOfflineOrder({ req, paymentMethod, items, couponCode, shipp
   const appliedCoupon = couponDoc && pricing.couponDiscount > 0 ? couponDoc : null;
 
   const user = await usersCollection.findOne({ email: customerEmail });
+    if (user?.isActive === false) {
+    const err = new Error('Your account is deactivated. Please contact support.');
+    err.status = 403;
+    throw err;
+  }
   const orderId = await generateOrderId();
 
   const orderData = {
@@ -2991,140 +2996,158 @@ app.get("/api/orders", verifyFirebaseToken, verifyStaff, async (req, res) => {
 // CUSTOMER MANAGEMENT API ROUTES
 // ============================================
 
-// ============================================
-// UPDATED CUSTOMER GET ROUTE WITH ADVANCED SORTING
-// Replace your existing /api/customers GET route with this
-// ============================================
+const CUSTOMER_ROLES = ['admin', 'staff', 'user'];
 
-app.get("/api/customers", verifyFirebaseToken, verifyStaff, async (req, res) => {
+// sortBy -> আসল field। displayName case-insensitive sort-এর জন্য _nameLower ব্যবহার হয়।
+const CUSTOMER_SORT_FIELDS = {
+  createdAt: 'createdAt',
+  lastLogin: 'lastLogin',
+  displayName: '_nameLower',
+  totalSpent: 'stats.totalSpent',
+  orderCount: 'stats.orderCount',
+};
+
+// _id (ObjectId) অথবা Firebase uid। অবৈধ ObjectId দিলে throw করে না।
+const customerFilter = (id) =>
+  ObjectId.isValid(id)
+    ? { $or: [{ _id: new ObjectId(id) }, { uid: String(id) }] }
+    : { uid: String(id) };
+
+// ক্রেতার অর্ডার হিসাব। totalSpent = শুধু paid। cancelled অর্ডার orderCount-এ ধরা হয় না।
+const customerStatsStages = () => [
+  {
+    $lookup: {
+      from: 'orders',
+      let: {
+        email: { $ifNull: ['$email', '__none__'] },
+        uid: { $ifNull: ['$uid', '__none__'] },
+      },
+      pipeline: [
+        {
+          $match: {
+            $expr: {
+              $or: [
+                { $eq: ['$customer.email', '$$email'] },
+                { $eq: ['$userId', '$$uid'] },
+              ],
+            },
+          },
+        },
+        {
+          $group: {
+            _id: null,
+            orderCount: { $sum: { $cond: [{ $ne: ['$status', 'cancelled'] }, 1, 0] } },
+            paidOrders: { $sum: { $cond: [{ $eq: ['$payment.status', 'paid'] }, 1, 0] } },
+            totalSpent: {
+              $sum: { $cond: [{ $eq: ['$payment.status', 'paid'] }, '$pricing.total', 0] },
+            },
+            lastOrderDate: { $max: '$createdAt' },
+          },
+        },
+      ],
+      as: 'orderStats',
+    },
+  },
+  {
+    $addFields: {
+      stats: {
+        orderCount: { $ifNull: [{ $arrayElemAt: ['$orderStats.orderCount', 0] }, 0] },
+        paidOrders: { $ifNull: [{ $arrayElemAt: ['$orderStats.paidOrders', 0] }, 0] },
+        totalSpent: { $ifNull: [{ $arrayElemAt: ['$orderStats.totalSpent', 0] }, 0] },
+        lastOrderDate: { $arrayElemAt: ['$orderStats.lastOrderDate', 0] },
+      },
+    },
+  },
+  { $project: { orderStats: 0 } },
+];
+
+const finalizeCustomer = (customer) => ({
+  ...customer,
+  stats: {
+    orderCount: customer.stats?.orderCount || 0,
+    paidOrders: customer.stats?.paidOrders || 0,
+    totalSpent: round2(customer.stats?.totalSpent || 0),
+    lastOrderDate: customer.stats?.lastOrderDate || null,
+  },
+});
+
+// isActive field না থাকা পুরোনো user-ও active ধরা হয়
+const buildCustomerQuery = ({ status, search, role } = {}) => {
+  const query = {};
+
+  if (typeof role === 'string' && CUSTOMER_ROLES.includes(role)) query.role = role;
+
+  if (status === 'active') query.isActive = { $ne: false };
+  else if (status === 'inactive') query.isActive = false;
+
+  const term = cleanString(search);
+  if (term) {
+    const rx = escapeRegex(term.slice(0, 80));
+    query.$or = [
+      { displayName: { $regex: rx, $options: 'i' } },
+      { email: { $regex: rx, $options: 'i' } },
+      { phoneNumber: { $regex: rx, $options: 'i' } },
+    ];
+  }
+
+  return query;
+};
+
+// CSV: সবসময় quote, ভেতরের " দ্বিগুণ, আর = + - @ দিয়ে শুরু হলে formula injection আটকাতে ' বসে
+const csvCell = (value) => {
+  let text = value === null || value === undefined ? '' : String(value);
+  if (/^[=+\-@\t\r]/.test(text)) text = `'${text}`;
+  return `"${text.replace(/"/g, '""')}"`;
+};
+
+// GET - তালিকা (Admin/Staff)
+app.get('/api/customers', verifyFirebaseToken, verifyStaff, async (req, res) => {
   try {
-    const { 
-      page = 1, 
-      limit = 10, 
-      status, 
-      search,
-      role,
-      sortBy = 'createdAt',
-      sortOrder = 'desc'
-    } = req.query;
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 10));
 
-    // Build query
-    const query = {};
+    const requestedSort = typeof req.query.sortBy === 'string' ? req.query.sortBy : '';
+    const sortBy = Object.prototype.hasOwnProperty.call(CUSTOMER_SORT_FIELDS, requestedSort)
+      ? requestedSort
+      : 'createdAt';
+    const order = req.query.sortOrder === 'asc' ? 1 : -1;
 
-    if (role && role !== 'all') {
-      query.role = role;
+    const query = buildCustomerQuery(req.query);
+
+    const pageStages = [];
+    if (sortBy === 'displayName') {
+      pageStages.push({
+        $addFields: { _nameLower: { $toLower: { $ifNull: ['$displayName', ''] } } },
+      });
     }
-    
-    if (status && status !== 'all') {
-      query.isActive = status === 'active';
-    }
-    
-    if (search) {
-      query.$or = [
-        { displayName: { $regex: search, $options: 'i' } },
-        { email: { $regex: search, $options: 'i' } },
-        { phoneNumber: { $regex: search, $options: 'i' } },
-      ];
-    }
-
-    // 🔥 FIXED: Case-insensitive sorting for displayName
-    let sortConfig = {};
-    const order = sortOrder === 'desc' ? -1 : 1;
-
-    // Only use database sorting for date fields
-    if (sortBy === 'createdAt' || sortBy === 'lastLogin') {
-      sortConfig = { [sortBy]: order };
-    } else {
-      // For other fields, we'll sort in memory after calculating stats
-      sortConfig = { createdAt: -1 }; // Default sort
-    }
-
-    // Execute query with pagination
-    const customers = await usersCollection
-      .find(query)
-      .sort(sortConfig)
-      .limit(limit * 1)
-      .skip((page - 1) * limit)
-      .toArray();
-
-    const count = await usersCollection.countDocuments(query);
-
-    // Calculate statistics for each customer
-    const customersWithStats = await Promise.all(
-      customers.map(async (customer) => {
-        const orderCount = await ordersCollection.countDocuments({
-          $or: [
-            { userId: customer.uid },
-            { 'customer.email': customer.email }
-          ]
-        });
-
-        const orders = await ordersCollection
-          .find({
-            $or: [
-              { userId: customer.uid },
-              { 'customer.email': customer.email }
-            ]
-          })
-          .toArray();
-
-        const totalSpent = orders.reduce((sum, order) => {
-          return sum + (order.pricing?.total || 0);
-        }, 0);
-
-        const lastOrder = orders.length > 0 
-          ? orders.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))[0]
-          : null;
-
-        return {
-          ...customer,
-          stats: {
-            orderCount,
-            totalSpent,
-            lastOrderDate: lastOrder?.createdAt || null,
-            averageOrderValue: orderCount > 0 ? totalSpent / orderCount : 0
-          }
-        };
-      })
+    pageStages.push(
+      { $sort: { [CUSTOMER_SORT_FIELDS[sortBy]]: order, _id: 1 } },
+      { $skip: (page - 1) * limit },
+      { $limit: limit }
     );
 
-    //Case-insensitive in-memory sorting
-    if (sortBy === 'displayName') {
-      customersWithStats.sort((a, b) => {
-        const nameA = (a.displayName || '').toLowerCase();
-        const nameB = (b.displayName || '').toLowerCase();
-        
-        if (order === 1) { // Ascending
-          return nameA.localeCompare(nameB);
-        } else { // Descending
-          return nameB.localeCompare(nameA);
-        }
-      });
-    } else if (sortBy === 'totalSpent') {
-      customersWithStats.sort((a, b) => {
-        const aSpent = a.stats?.totalSpent || 0;
-        const bSpent = b.stats?.totalSpent || 0;
-        return order === 1 ? aSpent - bSpent : bSpent - aSpent;
-      });
-    } else if (sortBy === 'orderCount') {
-      customersWithStats.sort((a, b) => {
-        const aCount = a.stats?.orderCount || 0;
-        const bCount = b.stats?.orderCount || 0;
-        return order === 1 ? aCount - bCount : bCount - aCount;
-      });
-    }
+    // totalSpent/orderCount দিয়ে sort করতে হলে আগে সবার হিসাব লাগে; নইলে শুধু পেজের ১০ জনের
+    const statsFirst = sortBy === 'totalSpent' || sortBy === 'orderCount';
+    const pipeline = [{ $match: query }];
+    if (statsFirst) pipeline.push(...customerStatsStages(), ...pageStages);
+    else pipeline.push(...pageStages, ...customerStatsStages());
+    pipeline.push({ $project: { _nameLower: 0 } });
+
+    const [customers, total] = await Promise.all([
+      usersCollection.aggregate(pipeline).toArray(),
+      usersCollection.countDocuments(query),
+    ]);
 
     res.status(200).json({
       success: true,
-      customers: customersWithStats,
+      customers: customers.map(finalizeCustomer),
       pagination: {
-        total: count,
-        totalPages: Math.ceil(count / limit),
-        currentPage: parseInt(page),
-        limit: parseInt(limit)
-      }
+        total,
+        totalPages: Math.ceil(total / limit),
+        currentPage: page,
+        limit,
+      },
     });
-
   } catch (error) {
     console.error('Get customers error:', error);
     res.status(500).json({
@@ -3135,271 +3158,56 @@ app.get("/api/customers", verifyFirebaseToken, verifyStaff, async (req, res) => 
   }
 });
 
-// GET - Get single customer details (Admin/Staff)
-app.get("/api/customers/:customerId", verifyFirebaseToken, verifyStaff, async (req, res) => {
+// GET - পরিসংখ্যান (Admin/Staff)। আগের মতো কিছু write করে না।
+app.get('/api/customers/stats/overview', verifyFirebaseToken, verifyStaff, async (req, res) => {
   try {
-    const { customerId } = req.params;
-
-    // Find customer by _id or uid
-    const customer = await usersCollection.findOne({
-      $or: [
-        { _id: new ObjectId(customerId) },
-        { uid: customerId }
-      ]
-    });
-
-    if (!customer) {
-      return res.status(404).json({
-        success: false,
-        message: 'Customer not found',
-      });
-    }
-
-    // Get customer orders
-    const orders = await ordersCollection
-      .find({
-        $or: [
-          { userId: customer.uid },
-          { 'customer.email': customer.email }
-        ]
-      })
-      .sort({ createdAt: -1 })
-      .toArray();
-
-    // Calculate stats
-    const totalSpent = orders.reduce((sum, order) => {
-      return sum + (order.pricing?.total || 0);
-    }, 0);
-
-    const completedOrders = orders.filter(o => o.status === 'delivered').length;
-    const pendingOrders = orders.filter(o => ['pending', 'processing'].includes(o.status)).length;
-
-    // Get wishlist count
-    const wishlistCount = await wishlistsCollection.countDocuments({
-      userId: customer.email
-    });
-
-    res.status(200).json({
-      success: true,
-      customer: {
-        ...customer,
-        stats: {
-          totalOrders: orders.length,
-          completedOrders,
-          pendingOrders,
-          totalSpent,
-          averageOrderValue: orders.length > 0 ? totalSpent / orders.length : 0,
-          wishlistCount
-        },
-        recentOrders: orders.slice(0, 5)
-      }
-    });
-
-  } catch (error) {
-    console.error('Get customer details error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to fetch customer details',
-      error: error.message,
-    });
-  }
-});
-
-// PATCH - Update customer status (Admin only)
-app.patch("/api/customers/:customerId/status", verifyFirebaseToken, verifyAdmin, async (req, res) => {
-  try {
-    const { customerId } = req.params;
-    const { isActive } = req.body;
-
-    if (typeof isActive !== 'boolean') {
-      return res.status(400).json({
-        success: false,
-        message: 'Invalid status value. Must be boolean.',
-      });
-    }
-
-    const result = await usersCollection.updateOne(
-      { $or: [{ _id: new ObjectId(customerId) }, { uid: customerId }] },
-      { 
-        $set: { 
-          isActive,
-          updatedAt: new Date()
-        } 
-      }
+    // UAE (UTC+4) অনুযায়ী মাসের শুরু
+    const uae = new Date(Date.now() + 4 * 60 * 60 * 1000);
+    const monthStart = new Date(
+      Date.UTC(uae.getUTCFullYear(), uae.getUTCMonth(), 1) - 4 * 60 * 60 * 1000
     );
+    const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    const customersOnly = { role: 'user' };
 
-    if (result.matchedCount === 0) {
-      return res.status(404).json({
-        success: false,
-        message: 'Customer not found',
-      });
-    }
-
-    const updatedCustomer = await usersCollection.findOne({
-      $or: [{ _id: new ObjectId(customerId) }, { uid: customerId }]
-    });
-
-    res.status(200).json({
-      success: true,
-      message: `Customer ${isActive ? 'activated' : 'deactivated'} successfully`,
-      customer: updatedCustomer,
-    });
-
-  } catch (error) {
-    console.error('Update customer status error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to update customer status',
-      error: error.message,
-    });
-  }
-});
-
-// PATCH - Update customer details (Admin only)
-app.patch("/api/customers/:customerId", verifyFirebaseToken, verifyAdmin, async (req, res) => {
-  try {
-    const { customerId } = req.params;
-    const { displayName, phoneNumber, address, preferences } = req.body;
-
-    const customer = await usersCollection.findOne({
-      $or: [{ _id: new ObjectId(customerId) }, { uid: customerId }]
-    });
-
-    if (!customer) {
-      return res.status(404).json({
-        success: false,
-        message: 'Customer not found',
-      });
-    }
-
-    // Build update object
-    const updateData = { updatedAt: new Date() };
-    
-    if (displayName) updateData.displayName = displayName;
-    if (phoneNumber) updateData.phoneNumber = phoneNumber;
-    if (address) updateData.address = { ...customer.address, ...address };
-    if (preferences) updateData.preferences = { ...customer.preferences, ...preferences };
-
-    await usersCollection.updateOne(
-      { $or: [{ _id: new ObjectId(customerId) }, { uid: customerId }] },
-      { $set: updateData }
-    );
-
-    const updatedCustomer = await usersCollection.findOne({
-      $or: [{ _id: new ObjectId(customerId) }, { uid: customerId }]
-    });
-
-    res.status(200).json({
-      success: true,
-      message: 'Customer updated successfully',
-      customer: updatedCustomer,
-    });
-
-  } catch (error) {
-    console.error('Update customer error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to update customer',
-      error: error.message,
-    });
-  }
-});
-
-// GET - Get customer statistics (Admin only)
-app.get("/api/customers/stats/overview", verifyFirebaseToken, verifyAdmin, async (req, res) => {
-  try {
-    // 🔧 FIX: Update existing users without lastLogin
-    await usersCollection.updateMany(
-      { lastLogin: { $exists: false } },
-      { $set: { lastLogin: new Date() } }
-    );
-
-    const totalCustomers = await usersCollection.countDocuments();
-    const adminCount = await usersCollection.countDocuments({ role: 'admin' });
-    const staffCount = await usersCollection.countDocuments({ role: 'staff' });
-    const regularUsers = await usersCollection.countDocuments({ role: 'user' });
-
-    // Active customers (based on isActive field AND recent login)
-    const activeCustomers = await usersCollection.countDocuments({ 
-      isActive: true 
-    });
-    
-    const inactiveCustomers = await usersCollection.countDocuments({ 
-      isActive: false 
-    });
-    
-    // Recently active users (logged in last 30 days)
-    const thirtyDaysAgo = new Date();
-    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
-    
-    const recentlyActiveUsers = await usersCollection.countDocuments({
-      lastLogin: { $gte: thirtyDaysAgo }
-    });
-
-    // New users this month
-    const firstDayOfMonth = new Date();
-    firstDayOfMonth.setDate(1);
-    firstDayOfMonth.setHours(0, 0, 0, 0);
-    
-    const newUsersThisMonth = await usersCollection.countDocuments({
-      createdAt: { $gte: firstDayOfMonth }
-    });
-
-    // ❌ BEFORE (Using distinct - not supported in API v1)
-    // const customersWithOrders = await ordersCollection.distinct('customer.email');
-
-    // ✅ AFTER (Using aggregation - supported in API v1)
-    const customersWithOrdersResult = await ordersCollection.aggregate([
-      {
-        $group: {
-          _id: '$customer.email'
-        }
-      },
-      {
-        $count: 'total'
-      }
-    ]).toArray();
-
-    const customersWithOrders = customersWithOrdersResult.length > 0 
-      ? customersWithOrdersResult[0].total 
-      : 0;
-
-    // Top customers by spending
-    const topCustomers = await ordersCollection.aggregate([
-      {
-        $match: { 'payment.status': 'paid' }
-      },
-      {
-        $group: {
-          _id: '$customer.email',
-          totalSpent: { $sum: '$pricing.total' },
-          orderCount: { $sum: 1 }
-        }
-      },
-      {
-        $sort: { totalSpent: -1 }
-      },
-      {
-        $limit: 5
-      }
-    ]).toArray();
+    const [
+      totalUsers,
+      adminCount,
+      staffCount,
+      regularUsers,
+      activeCustomers,
+      inactiveCustomers,
+      newUsersThisMonth,
+      recentlyActiveUsers,
+      withOrders,
+    ] = await Promise.all([
+      usersCollection.countDocuments({}),
+      usersCollection.countDocuments({ role: 'admin' }),
+      usersCollection.countDocuments({ role: 'staff' }),
+      usersCollection.countDocuments(customersOnly),
+      usersCollection.countDocuments({ ...customersOnly, isActive: { $ne: false } }),
+      usersCollection.countDocuments({ ...customersOnly, isActive: false }),
+      usersCollection.countDocuments({ ...customersOnly, createdAt: { $gte: monthStart } }),
+      usersCollection.countDocuments({ ...customersOnly, lastLogin: { $gte: thirtyDaysAgo } }),
+      ordersCollection
+        .aggregate([{ $group: { _id: '$customer.email' } }, { $count: 'total' }])
+        .toArray(),
+    ]);
 
     res.status(200).json({
       success: true,
       stats: {
-        totalCustomers,
-        activeCustomers,
-        inactiveCustomers,
+        totalUsers,
+        totalCustomers: regularUsers, // শুধু role: user
+        regularUsers,
         adminCount,
         staffCount,
-        regularUsers,
-        recentlyActiveUsers,
+        activeCustomers,
+        inactiveCustomers,
         newUsersThisMonth,
-        customersWithOrders,
-        topCustomers
-      }
+        recentlyActiveUsers,
+        customersWithOrders: withOrders[0]?.total || 0,
+      },
     });
-
   } catch (error) {
     console.error('Get customer stats error:', error);
     res.status(500).json({
@@ -3410,59 +3218,252 @@ app.get("/api/customers/stats/overview", verifyFirebaseToken, verifyAdmin, async
   }
 });
 
-// DELETE - Delete customer (Admin only)
-app.delete("/api/customers/:customerId", verifyFirebaseToken, verifyAdmin, async (req, res) => {
+// GET - CSV export (Admin)। বর্তমান filter মানে।
+app.get('/api/customers/export/csv', verifyFirebaseToken, verifyAdmin, async (req, res) => {
   try {
-    const { customerId } = req.params;
+    const query = buildCustomerQuery(req.query);
 
-    const customer = await usersCollection.findOne({
-      $or: [{ _id: new ObjectId(customerId) }, { uid: customerId }]
+    const customers = await usersCollection
+      .aggregate([
+        { $match: query },
+        { $sort: { createdAt: -1, _id: 1 } },
+        ...customerStatsStages(),
+      ])
+      .toArray();
+
+    const header = [
+      'Name', 'Email', 'Phone', 'Role', 'Status', 'Joined',
+      'Orders', 'Paid Orders', 'Total Spent (AED)',
+    ];
+
+    const rows = customers.map((raw) => {
+      const c = finalizeCustomer(raw);
+      return [
+        c.displayName || '',
+        c.email || '',
+        c.phoneNumber || '',
+        c.role || 'user',
+        c.isActive === false ? 'inactive' : 'active',
+        c.createdAt ? new Date(c.createdAt).toISOString().slice(0, 10) : '',
+        c.stats.orderCount,
+        c.stats.paidOrders,
+        c.stats.totalSpent.toFixed(2),
+      ];
     });
 
+    // BOM: Excel-এ বাংলা/আরবি নাম ঠিক দেখায়
+    const csv = '\uFEFF' + [header, ...rows].map((row) => row.map(csvCell).join(',')).join('\r\n');
+
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename=customers-${Date.now()}.csv`);
+    res.status(200).send(csv);
+  } catch (error) {
+    console.error('Export customers error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to export customers',
+      error: error.message,
+    });
+  }
+});
+
+// GET - একজনের বিস্তারিত (Admin/Staff)
+app.get('/api/customers/:customerId', verifyFirebaseToken, verifyStaff, async (req, res) => {
+  try {
+    const customer = await usersCollection.findOne(customerFilter(req.params.customerId));
+
     if (!customer) {
-      return res.status(404).json({
+      return res.status(404).json({ success: false, message: 'Customer not found' });
+    }
+
+    const orders = await ordersCollection
+      .find({ $or: [{ 'customer.email': customer.email }, { userId: customer.uid }] })
+      .project({ orderId: 1, status: 1, payment: 1, pricing: 1, createdAt: 1 })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    const live = orders.filter((o) => o.status !== 'cancelled');
+    const paid = orders.filter((o) => o.payment?.status === 'paid');
+    const totalSpent = round2(paid.reduce((sum, o) => sum + (o.pricing?.total || 0), 0));
+
+    const wishlistCount = await wishlistsCollection.countDocuments({ userId: customer.email });
+
+    res.status(200).json({
+      success: true,
+      customer: {
+        ...customer,
+        stats: {
+          totalOrders: live.length,
+          paidOrders: paid.length,
+          completedOrders: orders.filter((o) => o.status === 'delivered').length,
+          pendingOrders: orders.filter((o) => ['pending', 'processing'].includes(o.status)).length,
+          totalSpent,
+          averageOrderValue: paid.length > 0 ? round2(totalSpent / paid.length) : 0,
+          wishlistCount,
+        },
+        recentOrders: orders.slice(0, 5),
+      },
+    });
+  } catch (error) {
+    console.error('Get customer details error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch customer details',
+      error: error.message,
+    });
+  }
+});
+
+// PATCH - Active/Inactive (Admin)। Deactivate করলে Firebase লগইনও বন্ধ হয়।
+app.patch('/api/customers/:customerId/status', verifyFirebaseToken, verifyAdmin, async (req, res) => {
+  try {
+    const { isActive } = req.body || {};
+
+    if (typeof isActive !== 'boolean') {
+      return res.status(400).json({
         success: false,
-        message: 'Customer not found',
+        message: 'Invalid status value. Must be boolean.',
       });
     }
 
-    // Check if customer has orders
+    const filter = customerFilter(req.params.customerId);
+    const customer = await usersCollection.findOne(filter);
+
+    if (!customer) {
+      return res.status(404).json({ success: false, message: 'Customer not found' });
+    }
+
+    if (String(customer._id) === String(req.user._id)) {
+      return res.status(400).json({ success: false, message: 'You cannot change your own status' });
+    }
+
+    if (customer.role === 'admin' && !isActive) {
+      return res.status(400).json({
+        success: false,
+        message: 'Admin accounts cannot be deactivated. Change the role first.',
+      });
+    }
+
+    await usersCollection.updateOne(filter, { $set: { isActive, updatedAt: new Date() } });
+
+    let firebaseSynced = true;
+    if (customer.uid) {
+      try {
+        await admin.auth().updateUser(customer.uid, { disabled: !isActive });
+        if (!isActive) await admin.auth().revokeRefreshTokens(customer.uid);
+      } catch (firebaseError) {
+        firebaseSynced = false;
+        console.error('Firebase status sync failed:', customer.uid, firebaseError.message);
+      }
+    }
+
+    const updated = await usersCollection.findOne(filter);
+
+    res.status(200).json({
+      success: true,
+      message: `Customer ${isActive ? 'activated' : 'deactivated'} successfully`,
+      firebaseSynced,
+      customer: updated,
+    });
+  } catch (error) {
+    console.error('Update customer status error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to update customer status',
+      error: error.message,
+    });
+  }
+});
+
+// PATCH - নাম/ফোন/ঠিকানা/preferences (Admin)
+app.patch('/api/customers/:customerId', verifyFirebaseToken, verifyAdmin, async (req, res) => {
+  try {
+    const filter = customerFilter(req.params.customerId);
+    const customer = await usersCollection.findOne(filter);
+
+    if (!customer) {
+      return res.status(404).json({ success: false, message: 'Customer not found' });
+    }
+
+    const { displayName, phoneNumber, address, preferences } = req.body || {};
+    const updateData = { updatedAt: new Date() };
+
+    const name = cleanString(displayName);
+    const phone = cleanString(phoneNumber);
+    if (name) updateData.displayName = name.slice(0, 100);
+    if (phone) updateData.phoneNumber = phone.slice(0, 30);
+    if (address && typeof address === 'object') {
+      updateData.address = { ...customer.address, ...address };
+    }
+    if (preferences && typeof preferences === 'object') {
+      updateData.preferences = { ...customer.preferences, ...preferences };
+    }
+
+    await usersCollection.updateOne(filter, { $set: updateData });
+    const updated = await usersCollection.findOne(filter);
+
+    res.status(200).json({
+      success: true,
+      message: 'Customer updated successfully',
+      customer: updated,
+    });
+  } catch (error) {
+    console.error('Update customer error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to update customer',
+      error: error.message,
+    });
+  }
+});
+
+// DELETE - ক্রেতা মোছা (Admin)। অর্ডার থাকলে নয়।
+app.delete('/api/customers/:customerId', verifyFirebaseToken, verifyAdmin, async (req, res) => {
+  try {
+    const filter = customerFilter(req.params.customerId);
+    const customer = await usersCollection.findOne(filter);
+
+    if (!customer) {
+      return res.status(404).json({ success: false, message: 'Customer not found' });
+    }
+
+    if (String(customer._id) === String(req.user._id)) {
+      return res.status(400).json({ success: false, message: 'You cannot delete your own account' });
+    }
+
+    if (customer.role === 'admin') {
+      return res.status(400).json({
+        success: false,
+        message: 'Admin accounts cannot be deleted. Change the role first.',
+      });
+    }
+
     const orderCount = await ordersCollection.countDocuments({
-      $or: [
-        { userId: customer.uid },
-        { 'customer.email': customer.email }
-      ]
+      $or: [{ 'customer.email': customer.email }, { userId: customer.uid }],
     });
 
     if (orderCount > 0) {
       return res.status(400).json({
         success: false,
-        message: 'Cannot delete customer with existing orders. Deactivate instead.',
+        message: 'Cannot delete a customer with existing orders. Deactivate instead.',
       });
     }
 
-    // Delete from Firebase Auth
     try {
-      await admin.auth().deleteUser(customer.uid);
+      if (customer.uid) await admin.auth().deleteUser(customer.uid);
     } catch (firebaseError) {
-      console.error('Firebase deletion error:', firebaseError);
-      // Continue with database deletion even if Firebase fails
+      console.error('Firebase deletion error:', firebaseError.message);
     }
 
-    // Delete from database
-    await usersCollection.deleteOne({
-      $or: [{ _id: new ObjectId(customerId) }, { uid: customerId }]
-    });
+    await usersCollection.deleteOne(filter);
 
-    // Clean up related data
-    await wishlistsCollection.deleteMany({ userId: customer.email });
-    await cartsCollection.deleteMany({ userId: customer.email });
+    await Promise.all([
+      wishlistsCollection.deleteMany({ userId: customer.email }),
+      cartsCollection.deleteMany({ userId: customer.email }),
+      notificationsCollection.deleteMany({ audience: 'user', email: customer.email }),
+    ]);
 
-    res.status(200).json({
-      success: true,
-      message: 'Customer deleted successfully',
-    });
-
+    res.status(200).json({ success: true, message: 'Customer deleted successfully' });
   } catch (error) {
     console.error('Delete customer error:', error);
     res.status(500).json({
@@ -3473,100 +3474,52 @@ app.delete("/api/customers/:customerId", verifyFirebaseToken, verifyAdmin, async
   }
 });
 
-// POST - Send message to customer (Admin/Staff)
-app.post("/api/customers/:customerId/message", verifyFirebaseToken, verifyStaff, async (req, res) => {
+// POST - ক্রেতাকে বার্তা (Admin/Staff)। ক্রেতার নোটিফিকেশন বেলে পৌঁছায় (ইমেইল নয়)।
+app.post('/api/customers/:customerId/message', verifyFirebaseToken, verifyStaff, async (req, res) => {
   try {
-    const { customerId } = req.params;
-    const { subject, message } = req.body;
+    const subject = cleanString(req.body?.subject);
+    const message = cleanString(req.body?.message);
 
     if (!subject || !message) {
+      return res.status(400).json({ success: false, message: 'Subject and message are required' });
+    }
+    if (subject.length > 100 || message.length > 1000) {
       return res.status(400).json({
         success: false,
-        message: 'Subject and message are required',
+        message: 'Subject must be within 100 and message within 1000 characters',
       });
     }
 
-    const customer = await usersCollection.findOne({
-      $or: [{ _id: new ObjectId(customerId) }, { uid: customerId }]
+    const customer = await usersCollection.findOne(customerFilter(req.params.customerId));
+
+    if (!customer || !customer.email) {
+      return res.status(404).json({ success: false, message: 'Customer not found' });
+    }
+
+    await notificationsCollection.insertOne({
+      audience: 'user',
+      email: String(customer.email).toLowerCase(),
+      type: 'admin_message',
+      title: subject,
+      message,
+      orderId: null,
+      link: null,
+      readBy: [],
+      read: false,
+      sentBy: req.tokenEmail,
+      createdAt: new Date(),
     });
-
-    if (!customer) {
-      return res.status(404).json({
-        success: false,
-        message: 'Customer not found',
-      });
-    }
-
-    // TODO: Implement actual email sending logic here
-    // For now, just return success
-    console.log(`Sending message to ${customer.email}:`, { subject, message });
 
     res.status(200).json({
       success: true,
       message: 'Message sent successfully',
-      recipient: customer.email
+      recipient: customer.email,
     });
-
   } catch (error) {
     console.error('Send message error:', error);
     res.status(500).json({
       success: false,
       message: 'Failed to send message',
-      error: error.message,
-    });
-  }
-});
-
-// GET - Export customers data (Admin only)
-app.get("/api/customers/export/csv", verifyFirebaseToken, verifyAdmin, async (req, res) => {
-  try {
-    const customers = await usersCollection.find({}).toArray();
-
-    // Generate CSV
-    const csvHeader = 'Name,Email,Phone,Role,Status,Join Date,Total Orders,Total Spent\n';
-    
-    const csvData = await Promise.all(
-      customers.map(async (customer) => {
-        const orderCount = await ordersCollection.countDocuments({
-          $or: [
-            { userId: customer.uid },
-            { 'customer.email': customer.email }
-          ]
-        });
-
-        const orders = await ordersCollection.find({
-          $or: [
-            { userId: customer.uid },
-            { 'customer.email': customer.email }
-          ]
-        }).toArray();
-
-        const totalSpent = orders.reduce((sum, order) => sum + (order.pricing?.total || 0), 0);
-
-        return [
-          customer.displayName || '',
-          customer.email || '',
-          customer.phoneNumber || '',
-          customer.role || 'user',
-          customer.isActive ? 'active' : 'inactive',
-          customer.createdAt ? new Date(customer.createdAt).toLocaleDateString() : '',
-          orderCount,
-          totalSpent.toFixed(2)
-        ].join(',');
-      })
-    );
-
-    const csv = csvHeader + csvData.join('\n');
-
-    res.setHeader('Content-Type', 'text/csv');
-    res.setHeader('Content-Disposition', `attachment; filename=customers-${Date.now()}.csv`);
-    res.status(200).send(csv);
-
-  } catch (error) {
-    console.error('Export customers error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to export customers',
       error: error.message,
     });
   }
