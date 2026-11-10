@@ -6,6 +6,7 @@ const cookieParser = require("cookie-parser");
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 require("dotenv").config();
 const cloudinary = require("cloudinary").v2;
+const nodeCrypto = require("crypto");
 const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
 const port = process.env.PORT || 5000;
 
@@ -1396,8 +1397,11 @@ async function bumpCouponUsage(code) {
   );
 }
 
-async function createOfflineOrder({ req, paymentMethod, items, couponCode, shippingAddress }) {
-  const customerEmail = (req.tokenEmail || '').toLowerCase();
+async function createOfflineOrder({ req, paymentMethod, items, couponCode, shippingAddress, onBehalf = null }) {
+  const isOnBehalf = !!onBehalf;
+  const customerEmail = isOnBehalf
+    ? String(onBehalf.user.email || '').toLowerCase()
+    : (req.tokenEmail || '').toLowerCase();
   const userId = customerEmail;
 
   const pricedItems = await priceCartItems(items);
@@ -1406,16 +1410,20 @@ async function createOfflineOrder({ req, paymentMethod, items, couponCode, shipp
   const subtotal = pricedItems.reduce((sum, item) => sum + (item.price * item.qty), 0);
   const couponDoc = await loadValidCoupon(couponCode, subtotal);
   const pricing = computeOrderTotals(pricedItems, couponDoc);
-
-  // coupon থেকে সত্যিই ছাড় না পেলে (যেমন free_shipping) coupon সংরক্ষণ বা usage গণনা নয়
   const appliedCoupon = couponDoc && pricing.couponDiscount > 0 ? couponDoc : null;
 
-  const user = await usersCollection.findOne({ email: customerEmail });
-    if (user?.isActive === false) {
-    const err = new Error('Your account is deactivated. Please contact support.');
+  const user = isOnBehalf
+    ? onBehalf.user
+    : await usersCollection.findOne({ email: customerEmail });
+
+  if (user?.isActive === false) {
+    const err = new Error('This account is deactivated.');
     err.status = 403;
     throw err;
   }
+
+  const isOffline = !!user?.isOffline;
+  const actor = isOnBehalf ? (onBehalf.createdBy?.email || customerEmail) : customerEmail;
   const orderId = await generateOrderId();
 
   const orderData = {
@@ -1425,20 +1433,31 @@ async function createOfflineOrder({ req, paymentMethod, items, couponCode, shipp
       email: customerEmail,
       name: user?.displayName || 'Guest',
       phone: shippingAddress?.phone || user?.phoneNumber || '',
-      address: shippingAddress || user?.address || {}
+      address: shippingAddress || user?.address || {},
+      ...(user?.businessName ? { businessName: user.businessName } : {}),
+      ...(isOffline ? { isOffline: true, contactEmail: user.contactEmail || '' } : {})
     },
     items: pricedItems,
     currency: ORDER_CURRENCY,
     pricing,
-    payment: {
-      method: paymentMethod,
-      status: 'pending',
-    },
+    payment: { method: paymentMethod, status: 'pending' },
     status: 'pending',
-    statusHistory: [historyEntry('pending', customerEmail, 'Order placed')],
+    source: isOnBehalf ? (onBehalf.source || 'phone') : 'website',
+    statusHistory: [
+      historyEntry(
+        'pending',
+        actor,
+        isOnBehalf ? `Order created by staff (${onBehalf.source || 'phone'})` : 'Order placed'
+      )
+    ],
     createdAt: new Date(),
     updatedAt: new Date()
   };
+
+  if (isOnBehalf) {
+    orderData.createdBy = onBehalf.createdBy;
+    if (onBehalf.note) orderData.internalNote = onBehalf.note;
+  }
 
   if (appliedCoupon) {
     orderData.coupon = {
@@ -1457,24 +1476,45 @@ async function createOfflineOrder({ req, paymentMethod, items, couponCode, shipp
     await restoreStock(pricedItems);
     throw insertErr;
   }
-    await createNotification({
-    audience: 'staff',
-    type: 'order_new',
-    title: 'New order',
-    message: `${orderData.orderId} · ${pricing.currency} ${pricing.total} · ${
-      paymentMethod === 'bank_deposit' ? 'awaiting bank transfer' : 'cash on delivery'
-    }`,
-    orderId: orderData.orderId,
-    link: '/admin/orders'
-  });
-  await cartsCollection.updateOne(
-    { userId },
-    { $set: { items: [], updatedAt: new Date() } }
-  );
-  await bumpCouponUsage(appliedCoupon?.code);
 
+  if (!isOnBehalf) {
+    await createNotification({
+      audience: 'staff',
+      type: 'order_new',
+      title: 'New order',
+      message: `${orderData.orderId} · ${pricing.currency} ${pricing.total} · ${
+        paymentMethod === 'bank_deposit' ? 'awaiting bank transfer' : 'cash on delivery'
+      }`,
+      orderId: orderData.orderId,
+      link: '/admin/orders'
+    });
+    await cartsCollection.updateOne(
+      { userId },
+      { $set: { items: [], updatedAt: new Date() } }
+    );
+  } else if (!isOffline) {
+    await notifyCustomer(
+      orderData,
+      'order_placed',
+      'Order created',
+      `${orderData.orderId} · ${pricing.currency} ${pricing.total}`
+    );
+  }
+
+  await bumpCouponUsage(appliedCoupon?.code);
   return orderData;
 }
+
+// ফোন নম্বর → wa.me এর জন্য শুধু সংখ্যা (UAE ধরে: 05xxxxxxxx → 971xxxxxxxx)
+function normalizePhoneDigits(raw) {
+  let d = String(raw || '').replace(/\D/g, '');
+  if (d.startsWith('00')) d = d.slice(2);
+  if (d.length === 10 && d.startsWith('05')) d = '971' + d.slice(1);
+  return d;
+}
+
+// ক্রেতার কাছে যাওয়া অর্ডার থেকে ভেতরের ফিল্ড বাদ
+const stripInternal = ({ internalNote, createdBy, memoToken, ...safe }) => safe;
 
 function unwrapFindOneAndUpdate(result) {
   if (!result) return null;
@@ -2672,6 +2712,165 @@ app.patch("/api/notifications/:id/read", verifyFirebaseToken, async (req, res) =
   }
 });
 
+// ── অফলাইন ক্রেতা তৈরি (staff/admin) ──
+app.post("/api/admin/customers/offline", verifyFirebaseToken, verifyStaff, async (req, res) => {
+  try {
+    const name = cleanString(req.body.name).slice(0, 100);
+    const phone = cleanString(req.body.phone).slice(0, 30);
+    const phoneDigits = normalizePhoneDigits(phone);
+    if (!name || phoneDigits.length < 8) {
+      return res.status(400).json({ success: false, message: 'Name and a valid phone number are required' });
+    }
+
+    const existing = await usersCollection.findOne({ isOffline: true, phoneDigits });
+    if (existing) {
+      return res.json({ success: true, existing: true, customer: existing });
+    }
+
+    const hex = nodeCrypto.randomBytes(8).toString('hex');
+    const now = new Date();
+    const a = req.body.address && typeof req.body.address === 'object' ? req.body.address : {};
+    const doc = {
+      uid: `offline_${hex}`,
+      email: `offline-${hex}@offline.invalid`,
+      displayName: name,
+      phoneNumber: phone,
+      phoneDigits,
+      contactEmail: cleanString(req.body.email).toLowerCase().slice(0, 120),
+      businessName: cleanString(req.body.businessName).slice(0, 120),
+      address: {
+        fullName: name,
+        phone,
+        street: cleanString(a.street).slice(0, 200),
+        city: cleanString(a.city).slice(0, 80),
+        country: cleanString(a.country).slice(0, 60) || 'UAE'
+      },
+      role: 'user',
+      isActive: true,
+      isOffline: true,
+      preferences: { notifications: false },
+      createdBy: { email: req.user.email, name: req.user.displayName || '' },
+      createdAt: now,
+      updatedAt: now
+    };
+    const r = await usersCollection.insertOne(doc);
+    res.status(201).json({ success: true, existing: false, customer: { ...doc, _id: r.insertedId } });
+  } catch (error) {
+    console.error('Create offline customer error:', error);
+    res.status(500).json({ success: false, message: 'Failed to create customer' });
+  }
+});
+
+// ── staff/admin ক্রেতার হয়ে অর্ডার তৈরি করবে ──
+app.post("/api/admin/orders", verifyFirebaseToken, verifyStaff, async (req, res) => {
+  try {
+    const { customerId, items, couponCode } = req.body;
+    const paymentMethod = ['bank_deposit', 'cod'].includes(req.body.paymentMethod)
+      ? req.body.paymentMethod
+      : 'bank_deposit';
+    const source = ['phone', 'whatsapp', 'walk_in', 'other'].includes(req.body.source)
+      ? req.body.source
+      : 'phone';
+
+    if (!ObjectId.isValid(String(customerId || ''))) {
+      return res.status(400).json({ success: false, message: 'Select a customer' });
+    }
+    const customer = await usersCollection.findOne({ _id: new ObjectId(String(customerId)) });
+    if (!customer) {
+      return res.status(404).json({ success: false, message: 'Customer not found' });
+    }
+
+    const orderData = await createOfflineOrder({
+      req,
+      paymentMethod,
+      items,
+      couponCode: cleanString(couponCode) || undefined,
+      shippingAddress: customer.address && Object.keys(customer.address).length ? customer.address : null,
+      onBehalf: {
+        user: customer,
+        source,
+        note: cleanString(req.body.note).slice(0, 500),
+        createdBy: { email: req.user.email, name: req.user.displayName || '' }
+      }
+    });
+
+    res.status(201).json({
+      success: true,
+      message: 'Order created',
+      orderId: orderData.orderId,
+      order: orderData
+    });
+  } catch (error) {
+    console.error('Admin create order error:', error);
+    res.status(error.status || 500).json({
+      success: false,
+      message: error.message || 'Failed to create order'
+    });
+  }
+});
+
+// ── মেমো লিংকের টোকেন (staff/admin) ──
+app.post("/api/admin/orders/:orderId/memo-link", verifyFirebaseToken, verifyStaff, async (req, res) => {
+  try {
+    const order = await ordersCollection.findOne(
+      { orderId: req.params.orderId },
+      { projection: { memoToken: 1, orderId: 1 } }
+    );
+    if (!order) {
+      return res.status(404).json({ success: false, message: 'Order not found' });
+    }
+
+    let token = order.memoToken;
+    if (!token) {
+      token = nodeCrypto.randomBytes(16).toString('hex');
+      await ordersCollection.updateOne({ orderId: order.orderId }, { $set: { memoToken: token } });
+    }
+    res.json({ success: true, orderId: order.orderId, token });
+  } catch (error) {
+    console.error('Memo link error:', error);
+    res.status(500).json({ success: false, message: 'Failed to create memo link' });
+  }
+});
+
+// ── পাবলিক মেমো (লগইন ছাড়া, টোকেন লাগে) ──
+app.get("/api/memo/:orderId", async (req, res) => {
+  try {
+    const k = String(req.query.k || '');
+    const order = await ordersCollection.findOne({ orderId: req.params.orderId });
+
+    const stored = String(order?.memoToken || '');
+    const ok =
+      stored.length > 0 &&
+      stored.length === k.length &&
+      nodeCrypto.timingSafeEqual(Buffer.from(stored), Buffer.from(k));
+
+    if (!ok) {
+      return res.status(404).json({ success: false, message: 'Memo not found' });
+    }
+
+    res.json({
+      success: true,
+      memo: {
+        orderId: order.orderId,
+        createdAt: order.createdAt,
+        status: order.status,
+        customer: {
+          name: order.customer?.name || '',
+          phone: order.customer?.phone || '',
+          businessName: order.customer?.businessName || '',
+          address: order.customer?.address || {}
+        },
+        items: order.items,
+        pricing: order.pricing,
+        payment: { method: order.payment?.method, status: order.payment?.status }
+      }
+    });
+  } catch (error) {
+    console.error('Memo fetch error:', error);
+    res.status(500).json({ success: false, message: 'Failed to load memo' });
+  }
+});
+
 // ============================================
 // COD ORDER ROUTE
 // ============================================
@@ -2958,6 +3157,9 @@ app.get("/api/orders", verifyFirebaseToken, verifyStaff, async (req, res) => {
         { 'customer.email': { $regex: s, $options: 'i' } },
         { 'customer.name': { $regex: s, $options: 'i' } },
         { 'customer.address.fullName': { $regex: s, $options: 'i' } },
+        { 'customer.phone': { $regex: s, $options: 'i' } },
+        { 'customer.businessName': { $regex: s, $options: 'i' } },
+        { 'customer.contactEmail': { $regex: s, $options: 'i' } },
       ];
     }
 
@@ -3087,7 +3289,11 @@ const buildCustomerQuery = ({ status, search, role } = {}) => {
       { displayName: { $regex: rx, $options: 'i' } },
       { email: { $regex: rx, $options: 'i' } },
       { phoneNumber: { $regex: rx, $options: 'i' } },
+      { contactEmail: { $regex: rx, $options: 'i' } },
+      { businessName: { $regex: rx, $options: 'i' } },
     ];
+    const digits = term.replace(/\D/g, '');
+    if (digits.length >= 3) query.$or.push({ phoneDigits: { $regex: digits } });
   }
 
   return query;
@@ -3347,7 +3553,7 @@ app.patch('/api/customers/:customerId/status', verifyFirebaseToken, verifyAdmin,
     await usersCollection.updateOne(filter, { $set: { isActive, updatedAt: new Date() } });
 
     let firebaseSynced = true;
-    if (customer.uid) {
+    if (customer.uid && !customer.isOffline) {
       try {
         await admin.auth().updateUser(customer.uid, { disabled: !isActive });
         if (!isActive) await admin.auth().revokeRefreshTokens(customer.uid);
@@ -3450,7 +3656,7 @@ app.delete('/api/customers/:customerId', verifyFirebaseToken, verifyAdmin, async
     }
 
     try {
-      if (customer.uid) await admin.auth().deleteUser(customer.uid);
+      if (customer.uid && !customer.isOffline) await admin.auth().deleteUser(customer.uid);
     } catch (firebaseError) {
       console.error('Firebase deletion error:', firebaseError.message);
     }
@@ -3549,6 +3755,87 @@ app.post('/api/customers/:customerId/message', verifyFirebaseToken, verifyStaff,
         res.send(products);
       } catch (err) {
         res.status(500).send({ error: "Failed to fetch products" });
+      }
+    });
+
+        // Admin/Staff: ক্যাটাগরি অনুযায়ী প্রোডাক্টের আসল হিসাব
+    app.get("/api/admin/categories/overview", verifyFirebaseToken, verifyStaff, async (req, res) => {
+      try {
+        // status না থাকা পুরোনো প্রোডাক্টও active ধরা হয়
+        const isActive = {
+          $not: [{ $in: [{ $ifNull: ['$status', 'active'] }, ['draft', 'archived']] }],
+        };
+
+        const [mainRows, subRows] = await Promise.all([
+          productsCollection
+            .aggregate([
+              {
+                $group: {
+                  _id: '$mainCategory',
+                  total: { $sum: 1 },
+                  active: { $sum: { $cond: [isActive, 1, 0] } },
+                  draft: { $sum: { $cond: [{ $eq: ['$status', 'draft'] }, 1, 0] } },
+                  archived: { $sum: { $cond: [{ $eq: ['$status', 'archived'] }, 1, 0] } },
+                  stock: { $sum: { $cond: [isActive, { $ifNull: ['$stock', 0] }, 0] } },
+                  minPrice: { $min: '$newPrice' },
+                  maxPrice: { $max: '$newPrice' },
+                },
+              },
+            ])
+            .toArray(),
+          productsCollection
+            .aggregate([
+              { $unwind: '$categories' },
+              {
+                $group: {
+                  _id: { $toLower: '$categories' },
+                  name: { $first: '$categories' },
+                  total: { $sum: 1 },
+                  active: { $sum: { $cond: [isActive, 1, 0] } },
+                  mainCategories: { $addToSet: '$mainCategory' },
+                },
+              },
+              { $sort: { total: -1, _id: 1 } },
+            ])
+            .toArray(),
+        ]);
+
+        const byKey = Object.fromEntries(mainRows.map((r) => [r._id, r]));
+        const mainCategories = PRODUCT_CATEGORIES.map((key) => {
+          const r = byKey[key] || {};
+          return {
+            key,
+            total: r.total || 0,
+            active: r.active || 0,
+            draft: r.draft || 0,
+            archived: r.archived || 0,
+            stock: r.stock || 0,
+            minPrice: r.minPrice ?? null,
+            maxPrice: r.maxPrice ?? null,
+          };
+        });
+
+        const labels = subRows.map((r) => ({
+          name: r.name,
+          total: r.total,
+          active: r.active,
+          mainCategories: (r.mainCategories || []).filter(Boolean).sort(),
+        }));
+
+        res.json({
+          success: true,
+          mainCategories,
+          labels,
+          totals: {
+            products: mainCategories.reduce((s, c) => s + c.total, 0),
+            active: mainCategories.reduce((s, c) => s + c.active, 0),
+            inactive: mainCategories.reduce((s, c) => s + c.draft + c.archived, 0),
+            stock: mainCategories.reduce((s, c) => s + c.stock, 0),
+          },
+        });
+      } catch (error) {
+        console.error('Category overview error:', error);
+        res.status(500).json({ success: false, message: 'Failed to load category overview' });
       }
     });
 
@@ -4767,9 +5054,11 @@ app.get("/api/orders/:orderId", verifyFirebaseToken, async (req, res) => {
       }
     }
 
+    const isOwnerView = order.customer.email.toLowerCase() === userEmail.toLowerCase();
+
     res.json({
       success: true,
-      order: order
+      order: isOwnerView ? stripInternal(order) : order
     });
 
   } catch (error) {
@@ -4811,7 +5100,7 @@ app.get("/api/users/:userId/orders", verifyFirebaseToken, async (req, res) => {
     }
 
     const orders = await ordersCollection
-      .find(query)
+      .find(query, { projection: { internalNote: 0, createdBy: 0, memoToken: 0 } })
       .sort({ createdAt: -1 })
       .limit(limit * 1)
       .skip((page - 1) * limit)
