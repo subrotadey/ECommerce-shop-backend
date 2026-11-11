@@ -49,18 +49,12 @@ let addressesCollection, ordersCollection, cartsCollection, productsCollection, 
 app.post("/api/webhook", 
   express.raw({ type: 'application/json' }), 
   async (req, res) => {
-    console.log('\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-    console.log(' STRIPE WEBHOOK RECEIVED');
-    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-    
     const sig = req.headers['stripe-signature'];
     
     if (!sig) {
       console.error('❌ No Stripe signature found');
       return res.status(400).send('No Stripe signature');
     }
-
-    console.log('✅ Signature present');
 
     let event;
 
@@ -71,14 +65,7 @@ app.post("/api/webhook",
         process.env.STRIPE_WEBHOOK_SECRET
       );
       
-      console.log('✅ Webhook signature verified');
-      console.log('📦 Event Type:', event.type);
-      console.log('🆔 Event ID:', event.id);
-      
     } catch (err) {
-      console.error('❌ Webhook signature verification FAILED');
-      console.error('   Error:', err.message);
-      console.error('   Webhook Secret Configured:', !!process.env.STRIPE_WEBHOOK_SECRET);
       return res.status(400).send(`Webhook Error: ${err.message}`);
     }
 
@@ -88,14 +75,7 @@ app.post("/api/webhook",
         case 'checkout.session.completed':
           const session = event.data.object;
           
-          console.log('💳 Checkout Session Completed');
-          console.log('   Order ID:', session.client_reference_id);
-          console.log('   Session ID:', session.id);
-          console.log('   Payment Intent:', session.payment_intent);
-          console.log('   Payment Status:', session.payment_status);
-          
           if (session.payment_status === 'paid') {
-            console.log('✅ Payment confirmed - processing...');
             await handleSuccessfulPayment(session);
           } else {
             console.log('⚠️ Payment status not "paid":', session.payment_status);
@@ -118,13 +98,8 @@ app.post("/api/webhook",
           console.log('ℹ️ Unhandled event type:', event.type);
       }
     } catch (error) {
-      console.error('❌ Error processing webhook:', error);
-      console.error('   Stack:', error.stack);
       return res.status(500).json({ received: false, error: 'Webhook processing failed' });
     }
-
-    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
-    
     res.json({ received: true });
   }
 );
@@ -718,10 +693,8 @@ try {
     admin.initializeApp({
       credential: admin.credential.cert(serviceAccount)
     });
-    console.log('Firebase Admin initialized successfully');
   }
 } catch (error) {
-  console.error('Firebase initialization error:', error.message);
   throw error;
 }
 
@@ -1617,10 +1590,6 @@ app.get("/api/test/token", blockTestInProd, async (req, res) => {
   try {
     const authHeader = req.headers.authorization;
     
-    console.log('\n🧪 TOKEN TEST ROUTE HIT');
-    console.log('Authorization Header:', authHeader);
-    console.log('Headers:', JSON.stringify(req.headers, null, 2));
-    
     if (!authHeader) {
       return res.status(401).json({
         success: false,
@@ -1657,11 +1626,6 @@ app.get("/api/test/token", blockTestInProd, async (req, res) => {
 // 🧪 TEST ROUTE 2: Check Firebase token verification
 app.get("/api/test/verify-token", blockTestInProd, verifyFirebaseToken, async (req, res) => {
   try {
-    console.log('\n🧪 TOKEN VERIFICATION TEST');
-    console.log('Token verified successfully!');
-    console.log('User UID:', req.uid);
-    console.log('User Email:', req.tokenEmail);
-    
     res.json({
       success: true,
       message: 'Token verified successfully!',
@@ -1683,10 +1647,6 @@ app.get("/api/test/verify-token", blockTestInProd, verifyFirebaseToken, async (r
 // 🧪 TEST ROUTE 3: Check admin access
 app.get("/api/test/admin", blockTestInProd, verifyFirebaseToken, verifyAdmin, async (req, res) => {
   try {
-    console.log('\n🧪 ADMIN ACCESS TEST');
-    console.log('Admin verified!');
-    console.log('Admin user:', req.user);
-    
     res.json({
       success: true,
       message: 'Admin access verified!',
@@ -1731,11 +1691,6 @@ app.delete("/api/test/products/:id", blockTestInProd, verifyFirebaseToken, verif
   try {
     const id = req.params.id;
     
-    console.log('\n🧪 DELETE TEST');
-    console.log('Product ID:', id);
-    console.log('User:', req.tokenEmail);
-    console.log('Admin:', req.user.role);
-    
     // Don't actually delete, just check if we can
     const product = await productsCollection.findOne({ _id: new ObjectId(id) });
     
@@ -1769,14 +1724,9 @@ app.delete("/api/test/products/:id", blockTestInProd, verifyFirebaseToken, verif
 // HANDLE SUCCESSFUL PAYMENT FUNCTION
 // ============================================
 async function handleSuccessfulPayment(session) {
-  console.log('\n🔄 Starting handleSuccessfulPayment...');
-  
   try {
     const orderId = session.client_reference_id;
     const paymentIntentId = session.payment_intent;
-
-    console.log('📋 Processing Order:', orderId);
-    console.log('💳 Payment Intent:', paymentIntentId);
 
     if (!orderId) {
       console.error('❌ No order ID in session');
@@ -1797,15 +1747,9 @@ async function handleSuccessfulPayment(session) {
 
     const order = await fulfillPaidOrder(orderId, extraPaymentFields);
     if (!order) {
-      console.log('⚠️ Order already fulfilled or not pending:', orderId);
       return;
     }
-
-    console.log('🎉 Payment processing complete!\n');
   } catch (error) {
-    console.error('❌ ERROR in handleSuccessfulPayment:');
-    console.error('   Message:', error.message);
-    console.error('   Stack:', error.stack);
     throw error;
   }
 }
@@ -2020,6 +1964,147 @@ async function run() {
         } catch (error) {
           console.error('Site image reset error:', error);
           res.status(500).json({ success: false, message: 'Failed to reset image' });
+        }
+      }
+    );
+
+    // ============================================
+    // SITE VIDEOS (Home page video sections)
+    // ============================================
+    const SITE_VIDEO_SLOTS = ['brandVideo', 'collectionVideo'];
+    const SITE_VIDEO_FOLDER = 'site-videos';
+
+    const destroySiteVideo = async (publicId) => {
+      if (!publicId) return;
+      try {
+        await cloudinary.uploader.destroy(publicId, {
+          invalidate: true,
+          resource_type: 'video',
+        });
+      } catch (err) {
+        console.error('Site video cleanup failed:', publicId, err.message);
+      }
+    };
+
+    // PUBLIC: slot -> url
+    app.get('/api/site-settings/videos', async (req, res) => {
+      try {
+        const doc = await siteSettingsCollection.findOne({ _id: 'main' });
+        const videos = {};
+        for (const slot of SITE_VIDEO_SLOTS) {
+          if (doc?.videos?.[slot]?.url) videos[slot] = doc.videos[slot].url;
+        }
+        res.json({ success: true, videos });
+      } catch (error) {
+        console.error('Site videos error:', error);
+        res.status(500).json({ success: false, message: 'Failed to load site videos' });
+      }
+    });
+
+    // ADMIN: video-র signed upload তথ্য
+    app.get(
+      '/api/site-settings/video-upload-signature',
+      verifyFirebaseToken,
+      verifyAdmin,
+      (req, res) => {
+        try {
+          const timestamp = Math.round(Date.now() / 1000);
+          const signature = cloudinary.utils.api_sign_request(
+            { folder: SITE_VIDEO_FOLDER, timestamp },
+            process.env.CLOUDINARY_API_SECRET
+          );
+          res.json({
+            success: true,
+            timestamp,
+            signature,
+            folder: SITE_VIDEO_FOLDER,
+            apiKey: process.env.CLOUDINARY_API_KEY,
+            cloudName: process.env.CLOUDINARY_CLOUD_NAME,
+          });
+        } catch (error) {
+          res.status(500).json({ success: false, message: 'Could not sign upload' });
+        }
+      }
+    );
+
+    // ADMIN: একটি slot-এ video বসানো
+    app.put(
+      '/api/site-settings/videos/:slot',
+      verifyFirebaseToken,
+      verifyAdmin,
+      async (req, res) => {
+        try {
+          const { slot } = req.params;
+          if (!SITE_VIDEO_SLOTS.includes(slot)) {
+            return res.status(400).json({ success: false, message: 'Unknown video slot' });
+          }
+
+          const url = cleanString(req.body?.url);
+          const publicId = cleanString(req.body?.publicId);
+          const prefix = `https://res.cloudinary.com/${process.env.CLOUDINARY_CLOUD_NAME}/video/upload/`;
+
+          if (
+            !url.startsWith(prefix) ||
+            !publicId.startsWith(`${SITE_VIDEO_FOLDER}/`) ||
+            !url.includes(publicId)
+          ) {
+            return res.status(400).json({ success: false, message: 'Invalid video data' });
+          }
+
+          const result = await siteSettingsCollection.findOneAndUpdate(
+            { _id: 'main' },
+            {
+              $set: {
+                [`videos.${slot}`]: {
+                  url,
+                  publicId,
+                  updatedBy: req.tokenEmail,
+                  updatedAt: new Date(),
+                },
+                updatedAt: new Date(),
+              },
+            },
+            { upsert: true, returnDocument: 'before' }
+          );
+
+          const old = unwrapFindOneAndUpdate(result)?.videos?.[slot];
+          if (old?.publicId && old.publicId !== publicId) {
+            await destroySiteVideo(old.publicId);
+          }
+
+          res.json({ success: true, slot, url });
+        } catch (error) {
+          console.error('Site video save error:', error);
+          res.status(500).json({ success: false, message: 'Failed to save video' });
+        }
+      }
+    );
+
+    // ADMIN: video সরানো (section হোম থেকে লুকিয়ে যাবে)
+    app.delete(
+      '/api/site-settings/videos/:slot',
+      verifyFirebaseToken,
+      verifyAdmin,
+      async (req, res) => {
+        try {
+          const { slot } = req.params;
+          if (!SITE_VIDEO_SLOTS.includes(slot)) {
+            return res.status(400).json({ success: false, message: 'Unknown video slot' });
+          }
+
+          const result = await siteSettingsCollection.findOneAndUpdate(
+            { _id: 'main' },
+            { $unset: { [`videos.${slot}`]: '' }, $set: { updatedAt: new Date() } },
+            { returnDocument: 'before' }
+          );
+
+          const old = unwrapFindOneAndUpdate(result)?.videos?.[slot];
+          if (old?.publicId) await destroySiteVideo(old.publicId);
+
+          res.json({ success: true, slot });
+        } catch (error) {
+          console.error('Site video reset error:', error);
+          res.status(500).json({ success: false, message: 'Failed to remove video' });
         }
       }
     );
@@ -3735,7 +3820,7 @@ app.post('/api/customers/:customerId/message', verifyFirebaseToken, verifyStaff,
     // ============================================
     // PRODUCTS ROUTES
     // ============================================
-        app.get("/products", async (req, res) => {
+      app.get("/api/products", async (req, res) => {
       try {
         const { category, minPrice, maxPrice, size, color, tag } = req.query;
 
@@ -3852,7 +3937,7 @@ app.post('/api/customers/:customerId/message', verifyFirebaseToken, verifyStaff,
       }
     });
 
-    app.get("/products/:id", async (req, res) => {
+    app.get("/api/products/:id", async (req, res) => {
       try {
         const id = req.params.id;
 
@@ -4204,7 +4289,6 @@ app.get("/api/cart/:userId", verifyFirebaseToken, verifyCartOwner, async (req, r
       items: cart?.items || [] 
     });
   } catch (err) {
-    console.error("GET cart error:", err);
     res.status(500).json({ 
       success: false,
       error: "Failed to fetch cart",
@@ -4218,17 +4302,11 @@ app.post("/api/cart/:userId", verifyFirebaseToken, verifyCartOwner, async (req, 
   try {
     const userId = req.params.userId;
     const items = req.body.items || [];
-    
-    console.log('💾 POST /api/cart/:userId - Saving cart');
-    console.log('   User:', userId);
-    console.log('   Items to save:', items.length);
 
     // Validate items
     const validItems = items.filter(item => 
       item.key && item.productId && item.qty > 0
     );
-
-    console.log('   Valid items:', validItems.length);
 
     const result = await cartsCollection.updateOne(
       { userId },
@@ -4240,8 +4318,6 @@ app.post("/api/cart/:userId", verifyFirebaseToken, verifyCartOwner, async (req, 
       },
       { upsert: true }
     );
-
-    console.log('✅ Cart saved:', result.modifiedCount || result.upsertedCount ? 'Success' : 'No change');
 
     res.json({ 
       success: true, 
@@ -4718,11 +4794,6 @@ app.post("/api/create-checkout-session", verifyFirebaseToken, async (req, res) =
   try {
     const { items, userId, customerEmail, coupon } = req.body;
 
-    console.log('💳 Creating checkout session...');
-    console.log('   Customer:', customerEmail);
-    console.log('   Items:', items.length);
-    console.log('   Coupon:', coupon ? coupon.code : 'None');
-
     // Validation
     if (!items || items.length === 0) {
       return res.status(400).json({
@@ -4763,13 +4834,6 @@ app.post("/api/create-checkout-session", verifyFirebaseToken, async (req, res) =
     const shipping = coupon?.type === 'free_shipping' || subtotal > 1000 ? 0 : 100;
     
     const total = subtotal - discount + tax + shipping;
-
-    console.log('💰 Pricing breakdown:');
-    console.log('   Subtotal:', subtotal);
-    console.log('   Discount:', discount);
-    console.log('   Tax:', tax);
-    console.log('   Shipping:', shipping);
-    console.log('   Total:', total);
 
     // Generate unique order ID
     const orderId = await generateOrderId();
@@ -4925,9 +4989,6 @@ app.post("/api/create-checkout-session", verifyFirebaseToken, async (req, res) =
 
     await ordersCollection.insertOne(orderData);
 
-    console.log('✅ Checkout session created:', session.id);
-    console.log('✅ Order created:', orderId);
-
     res.json({
       success: true,
       sessionId: session.id,
@@ -4980,7 +5041,6 @@ app.get("/api/checkout/verify/:sessionId", verifyFirebaseToken, async (req, res)
     }
 
     if (existingOrder?.payment?.status === 'paid') {
-      console.log('⚠️ Order already paid, returning existing data');
       return res.json({
         success: true,
         paymentStatus: 'paid',
@@ -4990,8 +5050,6 @@ app.get("/api/checkout/verify/:sessionId", verifyFirebaseToken, async (req, res)
     }
 
     if (session.payment_status === 'paid') {
-      console.log('✅ Payment confirmed, fulfilling order:', orderId);
-
       // pending → paid atomic; cart clear ও stock কমানো এখানেই (webhook-এর সঙ্গে একই পথ)
       await fulfillPaidOrder(orderId, {
         'payment.stripeSessionId': session.id,
@@ -5001,8 +5059,6 @@ app.get("/api/checkout/verify/:sessionId", verifyFirebaseToken, async (req, res)
     }
 
     const updatedOrder = await ordersCollection.findOne({ orderId: orderId });
-
-    console.log('✅ Verify complete. Payment:', updatedOrder?.payment?.status, '| Order:', updatedOrder?.status);
 
     return res.json({
       success: true,
