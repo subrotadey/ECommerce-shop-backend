@@ -904,7 +904,7 @@ const verifyCartOwner = (req, res, next) => {
 const MOQ_PER_COLOR = 12;            // প্রতি Product + Color ন্যূনতম
 const BULK_DISCOUNT_THRESHOLD = 100; // পুরো অর্ডারের মোট qty
 const BULK_DISCOUNT_PERCENT = 5;
-const ORDER_CURRENCY = 'AED';
+const ORDER_CURRENCY = 'USD';
 const ALLOW_COUPON_WITH_BULK = true; // false করলে bulk ছাড় পেলে coupon কাজ করবে না
 
 const round2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
@@ -3439,7 +3439,7 @@ app.get('/api/customers/export/csv', verifyFirebaseToken, verifyAdmin, async (re
 
     const header = [
       'Name', 'Email', 'Phone', 'Role', 'Status', 'Joined',
-      'Orders', 'Paid Orders', 'Total Spent (AED)',
+      'Orders', 'Paid Orders', 'Total Spent (USD)',
     ];
 
     const rows = customers.map((raw) => {
@@ -4791,7 +4791,7 @@ app.post("/api/create-checkout-session", verifyFirebaseToken, async (req, res) =
 
   return {
     price_data: {
-      currency: 'bdt',
+      currency: 'usd',
       product_data: {
         name: item.name,
         description: `${item.size ? `Size: ${item.size}` : ''} ${item.color ? `Color: ${item.color}` : ''}`.trim() || undefined,
@@ -4808,7 +4808,7 @@ app.post("/api/create-checkout-session", verifyFirebaseToken, async (req, res) =
     if (discount > 0) {
       lineItems.push({
         price_data: {
-          currency: 'bdt',
+          currency: 'usd',
           product_data: {
             name: `Discount (${coupon.code})`,
             description: coupon.type === 'percentage' 
@@ -4825,7 +4825,7 @@ app.post("/api/create-checkout-session", verifyFirebaseToken, async (req, res) =
     if (tax > 0) {
       lineItems.push({
         price_data: {
-          currency: 'bdt',
+          currency: 'usd',
           product_data: {
             name: 'Tax (5%)',
             description: 'Sales tax'
@@ -4840,7 +4840,7 @@ app.post("/api/create-checkout-session", verifyFirebaseToken, async (req, res) =
     if (shipping > 0) {
       lineItems.push({
         price_data: {
-          currency: 'bdt',
+          currency: 'usd',
           product_data: {
             name: 'Shipping Fee',
             description: 'Standard shipping'
