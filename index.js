@@ -21,7 +21,9 @@ const allowedOrigins = [
   process.env.CLIENT_URL,
   "https://anisabaya.vercel.app",
   "https://anis-abaiya.web.app",
-  "https://anis-abaiya.firebaseapp.com"
+  "https://anis-abaiya.firebaseapp.com",
+  "https://anis-abaya-shop.web.app",
+  "https://anis-abaya-shop.firebaseapp.com"
 ].filter(Boolean); // Remove undefined values
 
 
